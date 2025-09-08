@@ -43,29 +43,12 @@ class Node(val index: Int) extends Actor {
 	var	source:Boolean	= false		/* true if we are the source.					*/
 	var	sink:Boolean	= false		/* true if we are the sink.					*/
 	var	edge: List[Edge] = Nil		/* adjacency list with edge objects shared with other nodes.	*/
-	var	debug = true			/* to enable printing.						*/
+	var	debug = false			/* to enable printing.						*/
 	
 	def min(a:Int, b:Int) : Int = { if (a < b) a else b }
 
 	def deg: Int = edge.length
 	def nextEdge(i: Int) = if (i + 1 < deg) i + 1 else 0
-
-	def residual(a: Edge, u:ActorRef) : Int = {
-		if(a.u == u) {
-			a.c + a.f
-		} else {
-			a.c - a.f
-		}
-	}
-
-	def updateFlow(a:Edge, u: ActorRef, amount: Int) = {
-		if(a.u == u) {
-			a.f -= amount
-		} else {
-			a.f += amount
-		}
-		println(id + " " + a.f)
-	}
 
 	def id: String = "@" + index;
 
@@ -92,21 +75,25 @@ class Node(val index: Int) extends Actor {
 		while (e > 0 && !fullCycle) {
 			val a = edge(i)
 			val neighbor = other(a, self)
-			val res = residual(a, self)
-			println("a.c " + a.c)
-			println("a.f " + a.f)
-			println("res " + res)
-			println("e " + e)
-			if (res != 0) {
-				val delta = min(e, res)
-				println("DELTA " +delta)
-				e -= delta
-				updateFlow(a,self,delta)
-				k += 1
-				neighbor ! Push(delta, h, a)
-			
+			var delta = 0;
+
+
+			if(a.u.equals(self)) {
+				delta = min(e, a.c - a.f)
+				a.f += delta
+			} else {
+				delta = min(e, a.c + a.f)
+				a.f -= delta
 			}
-			
+			delta = delta.abs
+			e -= delta.abs
+
+
+			if(delta != 0) {
+				k += 1
+
+				neighbor ! Push(delta, h, a)
+			}
 			
 			
 			i = nextEdge(i)
@@ -124,50 +111,49 @@ class Node(val index: Int) extends Actor {
 	case Print => status
 
 	case Excess => { 
-		println(id + "I send flow" +e )
 		sender ! Flow(e) /* send our current excess preflow to actor that asked for it. */ }
 
 	case edge:Edge => { this.edge = edge :: this.edge /* put this edge first in the adjacency-list. */ }
 
 	case Control(control:ActorRef)	=> this.control = control
 
-	case Sink	=> { sink = true; println(id + "I am sink") }
+	case Sink	=> { sink = true}
 
 	case Source(n:Int) => {
 	  h = n
 	  source = true
-	  println(id+"I am source")
 
 	  for (a <- edge) {
 		e -= a.c
-	    val nbr = other(a, self)
-		println("I push " +a.c + " to " + nbr)
-	    nbr ! Push(a.c, h, a) // neighbor gains excess
-		updateFlow(a, self, a.c)
+	    val neighbor = other(a, self)
+		if (a.u.equals(self)) {
+			a.f = a.c
+		} else {
+			a.f = -a.c
+		}
+
+		neighbor ! Push(a.c, h, a) // neighbor gains excess
 	    }
 	  
 	}
 
 	case Push(amount, fromH, edge) => {
 		if (fromH > h) {
-			if(debug){
-					println(id + "I accept" + amount)
-				}
 			e+= amount
-			if (!activated) {activated = true; control ! Activated(self)}
-			sender ! PushReply(-1)
-
 
 			if(source || sink) {
 				control ! Flow(e)
 			}
 
+			sender ! PushReply(-1)
+
+			if (!activated) {activated = true; control ! Activated(self)}
 		} else {
-			if(debug){
-					println( id + "I decline"+e + "My height is:"+h)
-				}
-			println(edge + "SENDER: " + sender + " " + amount)
-			updateFlow(edge, sender, amount)
+			if(edge.u.equals(self)) {
+				edge.f += amount
+			} else {
+				edge.f -= amount
+			}
 			sender ! PushReply(amount)
 			
 		}
@@ -181,6 +167,7 @@ class Node(val index: Int) extends Actor {
 			k -= 1
 		}
 
+		if(!source) assert(e >= 0)
 		if (e == 0 || sink || source) {
 			if(debug){
 				print(id + "deactivated" + e)
@@ -199,6 +186,7 @@ class Node(val index: Int) extends Actor {
 			if(debug){
 				println(id +"try again"+ e)
 			}
+			k =0
 			control ! Activated(self)
 		}
 	}
@@ -252,9 +240,8 @@ class Preflow extends Actor
 		} else if(sender.equals(node(s))) {
 			sourceFlow = f
 		}
-
 		if(sinkFlow + sourceFlow == 0) {
-			ret ! f
+			ret ! sinkFlow
 		}
 
 	}
@@ -273,7 +260,7 @@ class Preflow extends Actor
 }
 
 object main extends App {
-	implicit val t = Timeout(4 seconds);
+	implicit val t = Timeout(100 seconds);
 
 	val	begin = System.currentTimeMillis()
 	val system = ActorSystem("Main")
