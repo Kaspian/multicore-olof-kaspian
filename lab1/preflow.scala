@@ -15,7 +15,7 @@ case class Control(control:ActorRef)
 case class Source(n: Int)
 
 case class Activated(self: ActorRef)
-case class Push(amount: Int, fromH: Int)
+case class Push(amount: Int, fromH: Int, edge: Edge)
 case class PushReply(amount: Int)
 
 case object Discharge
@@ -50,6 +50,23 @@ class Node(val index: Int) extends Actor {
 	def deg: Int = edge.length
 	def nextEdge(i: Int) = if (i + 1 < deg) i + 1 else 0
 
+	def residual(a: Edge, u:ActorRef) : Int = {
+		if(a.u == u) {
+			a.c + a.f
+		} else {
+			a.c - a.f
+		}
+	}
+
+	def updateFlow(a:Edge, u: ActorRef, amount: Int) = {
+		if(a.u == u) {
+			a.f -= amount
+		} else {
+			a.f += amount
+		}
+		println(id + " " + a.f)
+	}
+
 	def id: String = "@" + index;
 
 	def other(a:Edge, u:ActorRef) : ActorRef = { if (u == a.u) a.v else a.u }
@@ -71,21 +88,32 @@ class Node(val index: Int) extends Actor {
 	def pushAll : Unit = {
 		var i = cur
 		var fullCycle = false
-		do {
+
+		while (e > 0 && !fullCycle) {
 			val a = edge(i)
 			val neighbor = other(a, self)
-			val res = a.c //räkna ut kvarvarande kapacitet
-			val delta = min(e, res)
-			e -= delta
-			neighbor ! Push(delta, h)
-			k += 1
+			val res = residual(a, self)
+			println("a.c " + a.c)
+			println("a.f " + a.f)
+			println("res " + res)
+			println("e " + e)
+			if (res != 0) {
+				val delta = min(e, res)
+				println("DELTA " +delta)
+				e -= delta
+				updateFlow(a,self,delta)
+				k += 1
+				neighbor ! Push(delta, h, a)
 			
-
+			}
+			
+			
+			
 			i = nextEdge(i)
 			fullCycle = (i == cur)
-		} while  (e > 0 && !fullCycle)
-		cur = i	
 		}
+		cur = i	
+	}
 			
 
 
@@ -109,60 +137,69 @@ class Node(val index: Int) extends Actor {
 	  h = n
 	  source = true
 	  println(id+"I am source")
+
 	  for (a <- edge) {
 		e -= a.c
 	    val nbr = other(a, self)
 		println("I push " +a.c + " to " + nbr)
-	    nbr ! Push(a.c, h) // neighbor gains excess
-		a.f += a.c
+	    nbr ! Push(a.c, h, a) // neighbor gains excess
+		updateFlow(a, self, a.c)
 	    }
 	  
 	}
 
-	case Push(amount, fromH) => {
+	case Push(amount, fromH, edge) => {
 		if (fromH > h) {
 			if(debug){
-					println(id + "I accept"+e)
+					println(id + "I accept" + amount)
 				}
 			e+= amount
 			if (!activated) {activated = true; control ! Activated(self)}
-			sender ! PushReply(0)
+			sender ! PushReply(-1)
+
+
+			if(source || sink) {
+				control ! Flow(e)
+			}
 
 		} else {
 			if(debug){
 					println( id + "I decline"+e + "My height is:"+h)
 				}
+			println(edge + "SENDER: " + sender + " " + amount)
+			updateFlow(edge, sender, amount)
 			sender ! PushReply(amount)
+			
 		}
 	}
 
 	case PushReply(amount) => {
-		if(amount == 0) {
+		if(amount == -1) {
 			
 		} else {
 			e += amount
 			k -= 1
 		}
 
-		if (e == 0) {
+		if (e == 0 || sink || source) {
 			if(debug){
-				print(id + "e = 0, deactivated" + e)
+				print(id + "deactivated" + e)
 			}
 			activated = false;
-			control ! Deactivated
-		} else if (k == 0) {
+			
+		} else if (k <= 0) {
 			if(debug){
 				println(id +"relabel time" + e)
 			}
 			relabel
+			k = 0
 			control ! Activated(self)
-			control ! Deactivated
+
 		} else {
 			if(debug){
 				println(id +"try again"+ e)
 			}
 			control ! Activated(self)
-			control ! Deactivated
 		}
 	}
 
@@ -188,7 +225,8 @@ class Preflow extends Actor
 	var	s	= 0;			/* index of source node.					*/
 	var	t	= 0;			/* index of sink node.					*/
 	var	n	= 0;			/* number of vertices in the graph.				*/
-	var activated = 0;
+	var sourceFlow = 0;
+	var sinkFlow = 0;
 	var	edge:Array[Edge]	= null	/* edges in the graph.						*/
 	var	node:Array[ActorRef]	= null	/* vertices in the graph.					*/
 	var	ret:ActorRef 		= null	/* Actor to send result to.					*/
@@ -209,26 +247,27 @@ class Preflow extends Actor
 	case edge:Array[Edge] => this.edge = edge
 
 	case Flow(f:Int) => {
-		ret ! f			/* somebody (hopefully the sink) told us its current excess preflow. */
+		if (sender.equals(node(t))) {
+			sinkFlow = f
+		} else if(sender.equals(node(s))) {
+			sourceFlow = f
+		}
+
+		if(sinkFlow + sourceFlow == 0) {
+			ret ! f
+		}
+
 	}
 
 	case Maxflow => {
 		ret = sender
-		if (activated == 0) {
-			node(t) ! Excess	/* ask sink for its excess preflow (which certainly still is zero). */
-		}
+		
+		//node(t) ! Excess	/* ask sink for its excess preflow (which certainly still is zero). */
+		
 	}
 
 	case Activated(who) => {
-		activated += 1
 		who ! Discharge
-	}
-
-	case Deactivated => {
-		activated -= 1 
-		if (activated == 0) {
-			node(t) ! Excess
-		}
 	}
 	}
 }
