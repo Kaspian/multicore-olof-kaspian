@@ -125,7 +125,7 @@ class Node(val index: Int) extends Actor {
 
 	  for (a <- edge) {
 		e -= a.c
-	    val neighbor = other(a, self)
+		val neighbor = other(a, self)
 		if (a.u.equals(self)) {
 			a.f = a.c
 		} else {
@@ -133,8 +133,10 @@ class Node(val index: Int) extends Actor {
 		}
 
 		neighbor ! Push(a.c, h, a) // neighbor gains excess
-	    }
-	  
+	  }
+
+	  control ! Flow(e)
+	  activated = false
 	}
 
 	case Push(amount, fromH, edge) => {
@@ -147,7 +149,7 @@ class Node(val index: Int) extends Actor {
 
 			sender ! PushReply(-1)
 
-			if (!activated) {activated = true; control ! Activated(self)}
+			if (!activated && !source && !sink) {activated = true; control ! Activated(self)}
 		} else {
 			if(edge.u.equals(self)) {
 				edge.f += amount
@@ -160,33 +162,30 @@ class Node(val index: Int) extends Actor {
 	}
 
 	case PushReply(amount) => {
+
 		if(amount == -1) {
-			
 		} else {
 			e += amount
-			k -= 1
 		}
+		k -= 1
 
 		if(!source) assert(e >= 0)
-		if (e == 0 || sink || source) {
+		if (e == 0 || source || sink) {
 			if(debug){
 				print(id + "deactivated" + e)
 			}
-			activated = false;
-			
-		} else if (k <= 0) {
+			activated = false;			
+		} else if (k == 0) {
 			if(debug){
 				println(id +"relabel time" + e)
 			}
 			relabel
-			k = 0
 			control ! Activated(self)
-
 		} else {
 			if(debug){
-				println(id +"try again"+ e)
+				println(id +"try again"+ e
+				)
 			}
-			k =0
 			control ! Activated(self)
 		}
 	}
@@ -240,6 +239,9 @@ class Preflow extends Actor
 		} else if(sender.equals(node(s))) {
 			sourceFlow = f
 		}
+		println("sinkFlow"+sinkFlow)
+		println("sourceFlow"+sourceFlow)
+
 		if(sinkFlow + sourceFlow == 0) {
 			ret ! sinkFlow
 		}
@@ -260,7 +262,7 @@ class Preflow extends Actor
 }
 
 object main extends App {
-	implicit val t = Timeout(100 seconds);
+	implicit val t = Timeout(600 seconds);
 
 	val	begin = System.currentTimeMillis()
 	val system = ActorSystem("Main")
