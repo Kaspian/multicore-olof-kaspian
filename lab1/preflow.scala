@@ -5,6 +5,7 @@ import akka.actor._
 import akka.pattern.ask
 import akka.util.Timeout
 import scala.concurrent.{Await,ExecutionContext,Future,Promise}
+import scala.collection.mutable
 import scala.concurrent.duration._
 import scala.language.postfixOps
 import scala.io._
@@ -13,19 +14,17 @@ case class Flow(f: Int)
 case class Debug(debug: Boolean)
 case class Control(control:ActorRef)
 case class Source(n: Int)
+case class ExcessFlow(e: Int)
+case class Push(delta:Int,height:Int,a:Edge)
+case class PushReply(excessBack:Int)
 
-case class Activated(self: ActorRef)
-case class Push(amount: Int, fromH: Int, edge: Edge)
-case class PushReply(amount: Int)
-
-case object Discharge
-case object Deactivated
 case object Print
 case object Start
 case object Excess
 case object Maxflow
 case object Sink
 case object Hello
+case object Activate
 
 class Edge(var u: ActorRef, var v: ActorRef, var c: Int) {
 	var	f = 0
@@ -34,21 +33,19 @@ class Edge(var u: ActorRef, var v: ActorRef, var c: Int) {
 class Node(val index: Int) extends Actor {
 	var	e = 0;				/* excess preflow. 						*/
 	var	h = 0;				/* height. 							*/
-	var k = 0;
-	var activated = false;
-
-	var cur = 0                       // current-arc index (0 .. degree-1)
-	
+	var k = 0;         //Unanswered pushes
+	var shufflesDone = 0;
 	var	control:ActorRef = null		/* controller to report to when e is zero. 			*/
 	var	source:Boolean	= false		/* true if we are the source.					*/
 	var	sink:Boolean	= false		/* true if we are the sink.					*/
-	var	edge: List[Edge] = Nil		/* adjacency list with edge objects shared with other nodes.	*/
+	var rejected = false
+	//var	edge: List[Edge] = Nil	/* adjacency list with edge objects shared with other nodes.	*/
+	var edge: mutable.ArrayDeque[Edge] = mutable.ArrayDeque.empty
+	var pushedNodes: mutable.HashSet[ActorRef] = mutable.HashSet.empty
 	var	debug = false			/* to enable printing.						*/
+
 	
 	def min(a:Int, b:Int) : Int = { if (a < b) a else b }
-
-	def deg: Int = edge.length
-	def nextEdge(i: Int) = if (i + 1 < deg) i + 1 else 0
 
 	def id: String = "@" + index;
 
@@ -68,41 +65,6 @@ class Node(val index: Int) extends Actor {
 		exit("relabel")
 	}
 
-	def pushAll : Unit = {
-		var i = cur
-		var fullCycle = false
-
-		while (e > 0 && !fullCycle) {
-			val a = edge(i)
-			val neighbor = other(a, self)
-			var delta = 0;
-
-
-			if(a.u.equals(self)) {
-				delta = min(e, a.c - a.f)
-				a.f += delta
-			} else {
-				delta = min(e, a.c + a.f)
-				a.f -= delta
-			}
-			delta = delta.abs
-			e -= delta.abs
-
-
-			if(delta != 0) {
-				k += 1
-
-				neighbor ! Push(delta, h, a)
-			}
-			
-			
-			i = nextEdge(i)
-			fullCycle = (i == cur)
-		}
-		cur = i	
-	}
-			
-
 
 	def receive = {
 
@@ -110,101 +72,94 @@ class Node(val index: Int) extends Actor {
 
 	case Print => status
 
-	case Excess => { 
-		sender ! Flow(e) /* send our current excess preflow to actor that asked for it. */ }
+	case Excess => { sender ! Flow(e) /* send our current excess preflow to actor that asked for it. */ }
 
-	case edge:Edge => { this.edge = edge :: this.edge /* put this edge first in the adjacency-list. */ }
+	//case edge:Edge => { this.edge = edge :: this.edge /* put this edge first in the adjacency-list. */ }
+	case edge: Edge => { this.edge.prepend(edge) }
 
 	case Control(control:ActorRef)	=> this.control = control
 
-	case Sink	=> { sink = true}
+	case Sink	=> { sink = true }
 
-	case Source(n:Int) => {
-	  h = n
-	  source = true
+	case Source(n:Int)	=> { 
+		h = n 
+		source = true
 
-	  for (a <- edge) {
-		e -= a.c
-	    val neighbor = other(a, self)
-		if (a.u.equals(self)) {
-			a.f = a.c
-		} else {
-			a.f = -a.c
+		for(a <- edge){  /* Loop through all edges and push capacity */
+				e-= a.c
+				other(a,self) ! Push(a.c,h,a)
+			}
+			control ! ExcessFlow(e) /*Message controller with negative flow */
 		}
 
-		neighbor ! Push(a.c, h, a) // neighbor gains excess
-	    }
-	  
-	}
-
-	case Push(amount, fromH, edge) => {
-		if (fromH > h) {
-			e+= amount
-
-			if(source || sink) {
-				control ! Flow(e)
-			}
-
-			sender ! PushReply(-1)
-
-			if (!activated) {activated = true; control ! Activated(self)}
-		} else {
-			if(edge.u.equals(self)) {
-				edge.f += amount
-			} else {
-				edge.f -= amount
-			}
-			sender ! PushReply(amount)
+	case Push(delta:Int,height:Int,a:Edge) => {
+		if(height>h){ //Push accepted
+			if (self == a.u) a.f += delta else a.f -= delta //Update flow of edge depending on u or v node
+			e += delta
 			
+			if(sink || source) control ! ExcessFlow(delta) //Message flow to controller if source or sink
+
+			sender ! PushReply(0) //Send 0 PushReply to confirm that Push was accepted
+			self ! Activate 
+
+		}else{ //Push rejected
+			sender ! PushReply(delta) //PushReply to confirm rejected
 		}
 	}
 
-	case PushReply(amount) => {
-		if(amount == -1) {
-			
-		} else {
-			e += amount
-			k -= 1
+	case PushReply(amount:Int) => {
+		e += amount
+		k -= 1
+		
+		if(amount > 0){ 
+			rejected = true
+		}else{
+			pushedNodes += sender
 		}
 
-		if(!source) assert(e >= 0)
-		if (e == 0 || sink || source) {
-			if(debug){
-				print(id + "deactivated" + e)
+		if(k == 0) {
+			if(rejected){ //reshuffle to not start att same edge every time
+				edge.append(edge.removeHead())
+				rejected = false
+				shufflesDone +=1
+				if(shufflesDone >= edge.length){ //If reshuffled through whole list, relabel
+					relabel
+					shufflesDone = 0
+				}
+				self ! Activate
+			} else { //Reset succesful pushes
+				pushedNodes.clear()
 			}
-			activated = false;
-			
-		} else if (k <= 0) {
-			if(debug){
-				println(id +"relabel time" + e)
-			}
-			relabel
-			k = 0
-			control ! Activated(self)
-
-		} else {
-			if(debug){
-				println(id +"try again"+ e)
-			}
-			k =0
-			control ! Activated(self)
 		}
-	}
+	}	
 
-	case Discharge => {
-		if(source || sink) {
-			control ! Deactivated
-		} else {
-			pushAll
+	case Activate => {
+
+		if(!(sink || source) && e > 0){
+			for(a <- edge if e > 0){
+				val neighbor = other(a, self)
+				if(!(pushedNodes.contains(neighbor))){
+					var res = if (self == a.u) a.c + a.f
+								else a.c - a.f
+					var delta = min(e, res)
+					if(delta > 0) {
+						k += 1
+						e -= delta
+						neighbor ! Push(delta,h,a)
+					}
+				}
+			}
 		}
-	}
+
+	} 
+
 
 	case _		=> {
-		println("" + index + " received an unknown message" + _) }
+		println("" + index + " received an unknown message" + _)
 
 		assert(false)
 	}
-
+ 	}
 }
 
 
@@ -213,11 +168,14 @@ class Preflow extends Actor
 	var	s	= 0;			/* index of source node.					*/
 	var	t	= 0;			/* index of sink node.					*/
 	var	n	= 0;			/* number of vertices in the graph.				*/
-	var sourceFlow = 0;
-	var sinkFlow = 0;
 	var	edge:Array[Edge]	= null	/* edges in the graph.						*/
 	var	node:Array[ActorRef]	= null	/* vertices in the graph.					*/
 	var	ret:ActorRef 		= null	/* Actor to send result to.					*/
+	var totalExcess = 0;
+	var debug = true
+
+	def enter(func: String): Unit = { if (debug) { println("Control enters " + func)}}
+	def exit(func: String): Unit = { if (debug) { println("Control exits " + func)}}
 
 	def receive = {
 
@@ -228,39 +186,34 @@ class Preflow extends Actor
 		t = n-1
 		for (u <- node)
 			u ! Control(self)
-		node(t) ! Sink
-		node(s) ! Source(n)
 	}
 
 	case edge:Array[Edge] => this.edge = edge
 
 	case Flow(f:Int) => {
-		if (sender.equals(node(t))) {
-			sinkFlow = f
-		} else if(sender.equals(node(s))) {
-			sourceFlow = f
-		}
-		if(sinkFlow + sourceFlow == 0) {
-			ret ! sinkFlow
-		}
-
+		ret ! f			/* somebody (hopefully the sink) told us its current excess preflow. */
 	}
 
 	case Maxflow => {
 		ret = sender
-		
+
+		node(s) ! Source(n)
+		node(t) ! Sink
+		node(s) ! Print
 		//node(t) ! Excess	/* ask sink for its excess preflow (which certainly still is zero). */
-		
+		/*if(debug)*/ //sender ! 666; /* 666 for debugging purposes*/
 	}
 
-	case Activated(who) => {
-		who ! Discharge
-	}
+	case ExcessFlow(e:Int)  => {
+		if(debug) println(totalExcess)
+		totalExcess += e
+		if(totalExcess == 0) node(t) ! Excess
+	} 
 	}
 }
 
 object main extends App {
-	implicit val t = Timeout(100 seconds);
+	implicit val t = Timeout(10 seconds);
 
 	val	begin = System.currentTimeMillis()
 	val system = ActorSystem("Main")
