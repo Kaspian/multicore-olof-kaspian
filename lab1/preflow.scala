@@ -96,11 +96,9 @@ class Node(val index: Int) extends Actor {
 		if(height>h){ //Push accepted
 			if (self == a.u) a.f += delta else a.f -= delta //Update flow of edge depending on u or v node
 			e += delta
-			
-			if(sink || source) control ! ExcessFlow(delta) //Message flow to controller if source or sink
-
 			sender ! PushReply(0) //Send 0 PushReply to confirm that Push was accepted
-			self ! Activate 
+			
+			if(sink || source) control ! ExcessFlow(delta) else self ! Activate //Message flow to controller if source or sink
 
 		}else{ //Push rejected
 			sender ! PushReply(delta) //PushReply to confirm rejected
@@ -111,17 +109,17 @@ class Node(val index: Int) extends Actor {
 		e += amount
 		k -= 1
 		
-		if(amount > 0){ 
+		if(amount > 0){ //reshuffle to not start att same edge every time
 			rejected = true
+			shufflesDone +=1
+			edge.append(edge.removeHead())
 		}else{
 			pushedNodes += sender
 		}
 
 		if(k == 0) {
-			if(rejected){ //reshuffle to not start att same edge every time
-				edge.append(edge.removeHead())
+			if(rejected){ 
 				rejected = false
-				shufflesDone +=1
 				if(shufflesDone >= edge.length){ //If reshuffled through whole list, relabel
 					relabel
 					shufflesDone = 0
@@ -134,23 +132,19 @@ class Node(val index: Int) extends Actor {
 	}	
 
 	case Activate => {
-
-		if(!(sink || source) && e > 0){
-			for(a <- edge if e > 0){
-				val neighbor = other(a, self)
-				if(!(pushedNodes.contains(neighbor))){
-					var res = if (self == a.u) a.c + a.f
-								else a.c - a.f
-					var delta = min(e, res)
-					if(delta > 0) {
-						k += 1
-						e -= delta
-						neighbor ! Push(delta,h,a)
-					}
+		for(a <- edge if e > 0){
+			val neighbor = other(a, self)
+			if(!(pushedNodes.contains(neighbor))){
+				var res = if (self == a.u) a.c + a.f
+							else a.c - a.f
+				var delta = min(e, res)
+				if(delta > 0) {
+					k += 1
+					e -= delta
+					neighbor ! Push(delta,h,a)
 				}
 			}
 		}
-
 	} 
 
 
@@ -213,7 +207,7 @@ class Preflow extends Actor
 }
 
 object main extends App {
-	implicit val t = Timeout(10 seconds);
+	implicit val t = Timeout(4 seconds);
 
 	val	begin = System.currentTimeMillis()
 	val system = ActorSystem("Main")
