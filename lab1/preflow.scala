@@ -116,6 +116,7 @@ class Node(val index: Int) extends Actor {
 		}else{
 			pushedNodes += sender
 		}
+		k -= 1
 
 		if(k == 0) {
 			if(rejected){ //reshuffle to not start att same edge every time
