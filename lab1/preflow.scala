@@ -194,8 +194,6 @@ class Preflow extends Actor
 		node(s) ! Source(n)
 		node(t) ! Sink
 		node(s) ! Print
-		//node(t) ! Excess	/* ask sink for its excess preflow (which certainly still is zero). */
-		/*if(debug)*/ //sender ! 666; /* 666 for debugging purposes*/
 	}
 
 	case ExcessFlow(e:Int)  => {
