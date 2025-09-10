@@ -83,6 +83,7 @@ struct node_t
 	int e;		  /* excess flow.			*/
 	list_t *edge; /* adjacency list.		*/
 	node_t *next; /* with excess preflow.		*/
+	pthread_mutex_t node_lock;
 };
 
 struct edge_t
@@ -103,6 +104,35 @@ struct graph_t
 	node_t *t;		/* sink.			*/
 	node_t *excess; /* nodes with e > 0 except s,t.	*/
 };
+
+/*
+typedef struct {
+	task_type_t type;
+	union {
+		struct { node_t* u, node_t* v } push; // Potentially remove e and add dir?
+		struct { node_t* node, int h } relabel;
+	} data;
+} task_t;
+*/
+
+#define B 8
+
+typedef struct
+{
+	node_t *in_nodes[B];
+	node_t *out_nodes[B];
+	uint32_t out_size;
+} queue;
+
+typedef struct
+{
+	node_t active_nodes[264]; // Change to be system specific?
+	uint32_t head, tail, count;
+
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+
+} g_queue;
 
 /* a remark about C arrays. the phrase above 'array of n nodes' is using
  * the word 'array' in a general sense for any language. in C an array
@@ -339,6 +369,33 @@ static graph_t *new_graph(FILE *in, int n, int m)
 	return g;
 }
 
+static void lock_edge_nodes(edge_t *a)
+{
+	if (a->u < a->v)
+	{
+		pthread_mutex_lock(&a->u->node_lock);
+		pthread_mutex_lock(&a->v->node_lock);
+	}
+	else
+	{
+		pthread_mutex_lock(&a->v->node_lock);
+		pthread_mutex_lock(&a->u->node_lock);
+	}
+}
+static void unlock_edge_nodes(edge_t *a)
+{
+	if (a->u < a->v)
+	{
+		pthread_mutex_unlock(&a->v->node_lock);
+		pthread_mutex_unlock(&a->u->node_lock);
+	}
+	else
+	{
+		pthread_mutex_unlock(&a->u->node_lock);
+		pthread_mutex_unlock(&a->v->node_lock);
+	}
+}
+
 static void enter_excess(graph_t *g, node_t *v)
 {
 	/* put v at the front of the list of nodes
@@ -381,7 +438,7 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 	pr("push from %d to %d: ", id(g, u), id(g, v));
 	pr("f = %d, c = %d, so ", e->f, e->c);
 
-	if (u == e->u)	
+	if (u == e->u)
 	{
 		d = MIN(u->e, e->c - e->f);
 		e->f += d;
@@ -540,36 +597,6 @@ static void free_graph(graph_t *g)
 	free(g->e);
 	free(g);
 }
-
-/*
-typedef struct {
-	task_type_t type;
-	union {
-		struct { node_t* u, node_t* v } push; // Potentially remove e and add dir?
-		struct { node_t* node, int h } relabel;	
-	} data;
-} task_t;
-*/
-
-#define B 8
-
-typedef struct {
-	node_t*  in_nodes[B];
-	node_t* out_nodes[B];
-	uint32_t out_size;
-} queue;
-
-typedef struct {
-	node_t active_nodes[264]; // Change to be system specific?
-	uint32_t head;
-	uint32_t tail;
-	uint32_t count;
-
-	pthread_mutex_t lock;
-	pthread_cond_t cond;
-
-} g_queue;
-
 
 int main(int argc, char *argv[])
 {

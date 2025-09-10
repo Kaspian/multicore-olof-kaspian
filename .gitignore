@@ -14,8 +14,10 @@
 !.gitignore
 !.md
 
+
 ### C ###
 # Prerequisites
+!*.c
 *.d
 
 # Object files
