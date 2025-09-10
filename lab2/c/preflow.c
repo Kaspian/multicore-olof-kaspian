@@ -34,7 +34,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <limits.h>
 
+#define B 8
 #define PRINT 0 /* enable/disable prints. */
 
 /* the funny do-while next clearly performs one iteration of the loop.
@@ -79,11 +82,12 @@ struct list_t
 
 struct node_t
 {
+	int in_queue;
 	int h;		  /* height.			*/
 	int e;		  /* excess flow.			*/
 	list_t *edge; /* adjacency list.		*/
 	node_t *next; /* with excess preflow.		*/
-	pthread_mutex_t node_lock;
+	pthread_mutex_t n_lock;
 };
 
 struct edge_t
@@ -103,36 +107,12 @@ struct graph_t
 	node_t *s;		/* source.			*/
 	node_t *t;		/* sink.			*/
 	node_t *excess; /* nodes with e > 0 except s,t.	*/
+    
+	pthread_mutex_t g_lock;
+	pthread_cond_t  cv;
+    int done;
+	int active_workers;
 };
-
-/*
-typedef struct {
-	task_type_t type;
-	union {
-		struct { node_t* u, node_t* v } push; // Potentially remove e and add dir?
-		struct { node_t* node, int h } relabel;
-	} data;
-} task_t;
-*/
-
-#define B 8
-
-typedef struct
-{
-	node_t *in_nodes[B];
-	node_t *out_nodes[B];
-	uint32_t out_size;
-} queue;
-
-typedef struct
-{
-	node_t active_nodes[264]; // Change to be system specific?
-	uint32_t head, tail, count;
-
-	pthread_mutex_t lock;
-	pthread_cond_t cond;
-
-} g_queue;
 
 /* a remark about C arrays. the phrase above 'array of n nodes' is using
  * the word 'array' in a general sense for any language. in C an array
@@ -334,6 +314,75 @@ static void connect(node_t *u, node_t *v, int c, edge_t *e)
 	add_edge(v, e);
 }
 
+/*
+static void lock_edge_nodes(edge_t *a)
+{
+       if (a->u < a->v)
+       {
+               pthread_mutex_lock(&a->u->n_lock);
+               pthread_mutex_lock(&a->v->n_lock);
+       }
+       else
+       {
+               pthread_mutex_lock(&a->v->n_lock);
+               pthread_mutex_lock(&a->u->n_lock);
+       }
+}
+
+static void unlock_edge_nodes(edge_t *a)
+{
+       if (a->u < a->v)
+       {
+               pthread_mutex_unlock(&a->v->n_lock);
+               pthread_mutex_unlock(&a->u->n_lock);
+       }
+       else
+       {
+               pthread_mutex_unlock(&a->u->n_lock);
+               pthread_mutex_unlock(&a->v->n_lock);
+       }
+}
+
+*/
+
+static void lock_edge_nodes(edge_t *a)
+{
+       if (a->u < a->v)
+       {
+               pthread_mutex_lock(&a->u->n_lock);
+               pthread_mutex_lock(&a->v->n_lock);
+       }
+       else
+       {
+               pthread_mutex_lock(&a->v->n_lock);
+               pthread_mutex_lock(&a->u->n_lock);
+       }
+}
+
+static void unlock_edge_nodes(edge_t *a)
+{
+       if (a->u < a->v)
+       {
+               pthread_mutex_unlock(&a->v->n_lock);
+               pthread_mutex_unlock(&a->u->n_lock);
+       }
+       else
+       {
+               pthread_mutex_unlock(&a->u->n_lock);
+               pthread_mutex_unlock(&a->v->n_lock);
+       }
+}
+
+
+static node_t *other(node_t *u, edge_t *e)
+{
+	if (u == e->u)
+		return e->v;
+	else
+		return e->u;
+}
+
+
 static graph_t *new_graph(FILE *in, int n, int m)
 {
 	graph_t *g;
@@ -369,33 +418,6 @@ static graph_t *new_graph(FILE *in, int n, int m)
 	return g;
 }
 
-static void lock_edge_nodes(edge_t *a)
-{
-	if (a->u < a->v)
-	{
-		pthread_mutex_lock(&a->u->node_lock);
-		pthread_mutex_lock(&a->v->node_lock);
-	}
-	else
-	{
-		pthread_mutex_lock(&a->v->node_lock);
-		pthread_mutex_lock(&a->u->node_lock);
-	}
-}
-static void unlock_edge_nodes(edge_t *a)
-{
-	if (a->u < a->v)
-	{
-		pthread_mutex_unlock(&a->v->node_lock);
-		pthread_mutex_unlock(&a->u->node_lock);
-	}
-	else
-	{
-		pthread_mutex_unlock(&a->u->node_lock);
-		pthread_mutex_unlock(&a->v->node_lock);
-	}
-}
-
 static void enter_excess(graph_t *g, node_t *v)
 {
 	/* put v at the front of the list of nodes
@@ -407,28 +429,35 @@ static void enter_excess(graph_t *g, node_t *v)
 	 *
 	 */
 
-	if (v != g->t && v != g->s)
-	{
-		v->next = g->excess;
-		g->excess = v;
-	}
+	if (v == g->s || v == g->t)
+        return;
+
+    pthread_mutex_lock(&g->g_lock);
+    if (!v->in_queue) {
+        v->in_queue = 1;
+        v->next = g->excess;
+        g->excess = v;
+        pthread_cond_signal(&g->cv);
+    }
+    pthread_mutex_unlock(&g->g_lock);
 }
 
 static node_t *leave_excess(graph_t *g)
 {
-	node_t *v;
-
 	/* take any node from the set of nodes with excess preflow
 	 * and for simplicity we always take the first.
 	 *
 	 */
 
-	v = g->excess;
-
-	if (v != NULL)
-		g->excess = v->next;
-
-	return v;
+    pthread_mutex_lock(&g->g_lock);
+    node_t* v = g->excess;
+    if (v) {
+        g->excess = v->next;
+        v->next = NULL;
+        v->in_queue = 0;
+    }
+    pthread_mutex_unlock(&g->g_lock);
+    return v;
 }
 
 static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
@@ -438,10 +467,12 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 	pr("push from %d to %d: ", id(g, u), id(g, v));
 	pr("f = %d, c = %d, so ", e->f, e->c);
 
+	lock_edge_nodes(e);
 	if (u == e->u)
 	{
 		d = MIN(u->e, e->c - e->f);
 		e->f += d;
+		pr("d: %d", d);
 	}
 	else
 	{
@@ -453,6 +484,7 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 
 	u->e -= d;
 	v->e += d;
+	unlock_edge_nodes(e);
 
 	/* the following are always true. */
 
@@ -462,15 +494,12 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 
 	if (u->e > 0)
 	{
-
 		/* still some remaining so let u push more. */
-
 		enter_excess(g, u);
 	}
 
 	if (v->e == d)
 	{
-
 		/* since v has d excess now it had zero before and
 		 * can now push.
 		 *
@@ -482,23 +511,146 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 
 static void relabel(graph_t *g, node_t *u)
 {
-	u->h += 1;
+    int min_h = INT_MAX;
+    list_t *p;
+    edge_t *e;
+    node_t *v;
 
-	pr("relabel %d now h = %d\n", id(g, u), u->h);
+    /* Iterate over all neighbors to find the minimum height with residual capacity */
+    for (p = u->edge; p != NULL; p = p->next)
+    {
+        e = p->edge;
 
-	enter_excess(g, u);
+        /* Lock both endpoints to safely read flow and height */
+        lock_edge_nodes(e);
+        v = other(u, e);
+
+        int rescap;
+        if (u == e->u)
+            rescap = e->c - e->f;  // residual capacity from u -> v
+        else
+            rescap = e->c + e->f;  // residual capacity from u <- v
+
+        if (rescap > 0)
+            min_h = MIN(min_h, v->h);
+
+        unlock_edge_nodes(e);
+    }
+
+    /* Now set u->h safely */
+    pthread_mutex_lock(&u->n_lock);
+    if (min_h < INT_MAX)
+        u->h = min_h + 1;  // standard relabel
+    else
+        u->h += 1;          // fallback if no residual neighbors
+    pthread_mutex_unlock(&u->n_lock);
+
+    /* Re-insert u into the excess worklist */
+    enter_excess(g, u);      // make sure enter_excess checks in_queue
 }
 
-static node_t *other(node_t *u, edge_t *e)
+void* worker(void* arg) {
+    graph_t* g = (graph_t*)arg;
+    node_t* u;
+    int can_push;
+
+    while (1) {
+        // Try to get a node to process
+        u = leave_excess(g); // already locks g->g_lock internally
+        if (u == NULL) {
+            // No work, go wait
+            pthread_mutex_lock(&g->g_lock);
+            g->active_workers--;
+
+            if (g->active_workers == 0) {
+                // last worker, we are done
+                g->done = 1;
+                pthread_cond_broadcast(&g->cv);
+                pthread_mutex_unlock(&g->g_lock);
+                return NULL;
+            }
+
+            // wait until a worker signals new work
+            while ((u = g->excess) == NULL && !g->done) {
+                pthread_cond_wait(&g->cv, &g->g_lock);
+            }
+
+            g->active_workers++;
+            pthread_mutex_unlock(&g->g_lock);
+
+            if (u == NULL) continue; // still no node to process
+        }
+
+        // --- do push/relabel on node u ---
+        can_push = 0;
+        list_t* p;
+        edge_t* e;
+        node_t* v;
+        int b;
+
+        for (p = u->edge; p != NULL; p = p->next) {
+            e = p->edge;
+            if (u == e->u) { v = e->v; b = 1; } 
+            else { v = e->u; b = -1; }
+
+			pthread_mutex_lock(&u->n_lock);
+			int uh = u->h;
+			pthread_mutex_unlock(&u->n_lock);
+
+			pthread_mutex_lock(&v->n_lock);
+			int vh = v->h;
+			pthread_mutex_unlock(&v->n_lock);
+
+			lock_edge_nodes(e);
+			int ef = e->f;
+			unlock_edge_nodes(e);
+			
+			can_push = (uh > vh) && (b * ef < e->c);
+			pr("This gets to? can_push: %d", can_push);
+
+            if (can_push) {
+                push(g, u, v, e);
+                break; // push at most once
+            }
+        }
+
+        if (!can_push) {
+			pr("This enters?");
+            relabel(g, u);
+		}
+    }
+}
+
+
+void init_mutexes(graph_t *g)
 {
-	if (u == e->u)
-		return e->v;
-	else
-		return e->u;
+	pthread_mutex_init(&g->g_lock, NULL);
+	pthread_cond_init(&g->cv, NULL);
+	g->done = 0;
+
+	for(int i = 0; i < g->n; i+=1)
+	{
+		pthread_mutex_init(&g->v[i].n_lock, NULL);
+	}
+}
+
+void destroy_mutexes(graph_t *g)
+{
+	pthread_mutex_destroy(&g->g_lock);
+	pthread_cond_destroy(&g->cv);
+	
+	for(int i = 0; i < g->n; i+=1)
+	{
+		pthread_mutex_destroy(&g->v[i].n_lock);
+	}
 }
 
 int preflow(graph_t *g)
 {
+	/* Initialize the graph lock and the individual nodes' locks */
+	init_mutexes(g);
+
+	/* --- Start of algorithm - kept sequential for now. */
 	node_t *s;
 	node_t *u;
 	node_t *v;
@@ -508,72 +660,54 @@ int preflow(graph_t *g)
 
 	s = g->s;
 	s->h = g->n;
-
-	p = s->edge;
+	
+	// Initialize large (quickfix)
+	s->e = 0;
+	for (p = s->edge; p != NULL; p = p->next) {
+    	e = p->edge;
+		if (s == e->u)
+			s->e += e->c;
+		else
+			s->e += e->c;
+	}
 
 	/* start by pushing as much as possible (limited by
 	 * the edge capacity) from the source to its neighbors.
 	 *
 	 */
 
-	while (p != NULL)
-	{
-		e = p->edge;
-		p = p->next;
-
-		s->e += e->c;
-		push(g, s, other(s, e), e);
+	p = s->edge;
+	while (p != NULL) {
+    	e = p->edge;
+    	push(g, s, other(s,e), e);
+    	p = p->next;
 	}
 
 	/* then loop until only s and/or t have excess preflow. */
 
-	while ((u = leave_excess(g)) != NULL)
-	{
+	/* --- End of Start of algorithm, below is multi-threaded improvements */
 
-		/* u is any node with excess preflow. */
+	int threadcount = 8; // TODO: Optimal amount is device specific
+	pthread_t threads[threadcount];
+	g->active_workers = threadcount;
+	g->done = 0;
 
-		pr("selected u = %d with ", id(g, u));
-		pr("h = %d and e = %d\n", u->h, u->e);
-
-		/* if we can push we must push and only if we could
-		 * not push anything, we are allowed to relabel.
-		 *
-		 * we can push to multiple nodes if we wish but
-		 * here we just push once for simplicity.
-		 *
-		 */
-
-		v = NULL;
-		p = u->edge;
-
-		while (p != NULL)
-		{
-			e = p->edge;
-			p = p->next;
-
-			if (u == e->u)
-			{
-				v = e->v;
-				b = 1;
-			}
-			else
-			{
-				v = e->u;
-				b = -1;
-			}
-
-			if (u->h > v->h && b * e->f < e->c)
-				break;
-			else
-				v = NULL;
+	for(int i = 0; i < threadcount; i++) {
+		if (pthread_create(&threads[i], NULL, worker, g) != 0) {
+		    perror("pthread_create");
+		    exit(1);
 		}
-
-		if (v != NULL)
-			push(g, u, v, e);
-		else
-			relabel(g, u);
 	}
 
+	/* --- Algorithm happens in the workers - need some waiting criteria / way to know that the algorithm is actully
+	done here. I.e some statement like 'wait for finish', like the '? Preflow' message in the Akka implementation. */
+
+	/* --- After algorithm finish, join all created threads and destroy locks */
+	for (int i = 0; i < threadcount; i++) {
+		pthread_join(threads[i], NULL);
+	}
+
+	destroy_mutexes(g);
 	return g->t->e;
 }
 
@@ -597,6 +731,7 @@ static void free_graph(graph_t *g)
 	free(g->e);
 	free(g);
 }
+
 
 int main(int argc, char *argv[])
 {
