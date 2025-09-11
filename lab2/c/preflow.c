@@ -429,8 +429,7 @@ static void enter_excess(graph_t *g, node_t *v)
 	 *
 	 */
 
-	if (v == g->s || v == g->t)
-        return;
+    if (v == g->s || v == g->t) return;
 
     pthread_mutex_lock(&g->g_lock);
     if (!v->in_queue) {
@@ -440,6 +439,18 @@ static void enter_excess(graph_t *g, node_t *v)
         pthread_cond_signal(&g->cv);
     }
     pthread_mutex_unlock(&g->g_lock);
+}
+
+static node_t *leave_excess_no_lock(graph_t *g)
+{
+	// TODO: Obviously change this whole pattern - this is a quick fix.
+    node_t* v = g->excess;
+    if (v) {
+        g->excess = v->next;
+        v->next = NULL;
+        v->in_queue = 0;
+    }
+    return v;
 }
 
 static node_t *leave_excess(graph_t *g)
@@ -472,12 +483,13 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 	{
 		d = MIN(u->e, e->c - e->f);
 		e->f += d;
-		pr("d: %d", d);
+		pr("d: %d ::", d);
 	}
 	else
 	{
 		d = MIN(u->e, e->c + e->f);
 		e->f -= d;
+		pr("d: -%d ::", d);
 	}
 
 	pr("pushing %d\n", d);
@@ -551,35 +563,36 @@ static void relabel(graph_t *g, node_t *u)
 
 void* worker(void* arg) {
     graph_t* g = (graph_t*)arg;
-    node_t* u;
+    node_t* u = NULL;
     int can_push;
+	int t_done = 0;
 
     while (1) {
-        // Try to get a node to process
-        u = leave_excess(g); // already locks g->g_lock internally
-        if (u == NULL) {
-            // No work, go wait
-            pthread_mutex_lock(&g->g_lock);
-            g->active_workers--;
+		u = leave_excess(g);
+		if(u == NULL) {
+			pthread_mutex_lock(&g->g_lock);
+			g->active_workers--;
+			if (g->active_workers == 0 && g->excess == NULL) {
+				g->done = 1;
+				pthread_cond_broadcast(&g->cv);
+				pthread_mutex_unlock(&g->g_lock);
+				return NULL;
+			}
 
-            if (g->active_workers == 0) {
-                // last worker, we are done
-                g->done = 1;
-                pthread_cond_broadcast(&g->cv);
-                pthread_mutex_unlock(&g->g_lock);
-                return NULL;
-            }
+			while ((u = leave_excess_no_lock(g)) == NULL && !g->done) {
+				pthread_cond_wait(&g->cv, &g->g_lock);
+			}
 
-            // wait until a worker signals new work
-            while ((u = g->excess) == NULL && !g->done) {
-                pthread_cond_wait(&g->cv, &g->g_lock);
-            }
+			if (g->done) {
+				pthread_mutex_unlock(&g->g_lock);
+				return NULL;
+			}
 
-            g->active_workers++;
-            pthread_mutex_unlock(&g->g_lock);
+			g->active_workers++;
+			pthread_mutex_unlock(&g->g_lock);
 
-            if (u == NULL) continue; // still no node to process
-        }
+			if (u == NULL) continue; // woke up but no work (done == 1)
+		}
 
         // --- do push/relabel on node u ---
         can_push = 0;
@@ -592,7 +605,6 @@ void* worker(void* arg) {
             e = p->edge;
             if (u == e->u) { v = e->v; b = 1; } 
             else { v = e->u; b = -1; }
-
 			pthread_mutex_lock(&u->n_lock);
 			int uh = u->h;
 			pthread_mutex_unlock(&u->n_lock);
@@ -606,7 +618,6 @@ void* worker(void* arg) {
 			unlock_edge_nodes(e);
 			
 			can_push = (uh > vh) && (b * ef < e->c);
-			pr("This gets to? can_push: %d", can_push);
 
             if (can_push) {
                 push(g, u, v, e);
@@ -615,7 +626,6 @@ void* worker(void* arg) {
         }
 
         if (!can_push) {
-			pr("This enters?");
             relabel(g, u);
 		}
     }
@@ -661,7 +671,7 @@ int preflow(graph_t *g)
 	s = g->s;
 	s->h = g->n;
 	
-	// Initialize large (quickfix)
+	// Initialize sinks excess capacity to be the sum of outgoing capacities
 	s->e = 0;
 	for (p = s->edge; p != NULL; p = p->next) {
     	e = p->edge;
@@ -678,16 +688,16 @@ int preflow(graph_t *g)
 
 	p = s->edge;
 	while (p != NULL) {
-    	e = p->edge;
-    	push(g, s, other(s,e), e);
-    	p = p->next;
+		e = p->edge;
+		push(g, s, other(s,e), e);
+		p = p->next;
 	}
 
 	/* then loop until only s and/or t have excess preflow. */
 
 	/* --- End of Start of algorithm, below is multi-threaded improvements */
 
-	int threadcount = 8; // TODO: Optimal amount is device specific
+	int threadcount = 4; // TODO: Optimal amount is device specific
 	pthread_t threads[threadcount];
 	g->active_workers = threadcount;
 	g->done = 0;
@@ -699,14 +709,18 @@ int preflow(graph_t *g)
 		}
 	}
 
-	/* --- Algorithm happens in the workers - need some waiting criteria / way to know that the algorithm is actully
-	done here. I.e some statement like 'wait for finish', like the '? Preflow' message in the Akka implementation. */
+	pthread_mutex_lock(&g->g_lock);
+	while(!g->done) {
+		pthread_cond_wait(&g->cv, &g->g_lock);
+	}
+	pthread_mutex_unlock(&g->g_lock);
 
 	/* --- After algorithm finish, join all created threads and destroy locks */
 	for (int i = 0; i < threadcount; i++) {
 		pthread_join(threads[i], NULL);
 	}
 
+	pr("\n algorithm finished - all threads inactive, no more active nodes\n");
 	destroy_mutexes(g);
 	return g->t->e;
 }
