@@ -37,7 +37,6 @@
 #include <unistd.h>
 #include <limits.h>
 
-#define B 8
 #define PRINT 0 /* enable/disable prints. */
 
 /* the funny do-while next clearly performs one iteration of the loop.
@@ -73,6 +72,7 @@ typedef struct graph_t graph_t;
 typedef struct node_t node_t;
 typedef struct edge_t edge_t;
 typedef struct list_t list_t;
+enum LOCK_DIRECTION { FORWARD_U_TO_V, BACKWARD_V_TO_U };
 
 struct list_t
 {
@@ -82,13 +82,13 @@ struct list_t
 
 struct node_t
 {
-    int node_id;
-	int in_queue;
 	int h;		  /* height.			*/
 	int e;		  /* excess flow.			*/
 	list_t *edge; /* adjacency list.		*/
 	node_t *next; /* with excess preflow.		*/
-	pthread_mutex_t n_lock;
+
+	int is_in_queue; /* flag to keep track of whether already in the excess queue */
+	pthread_mutex_t n_lock; /* individual lock for each node */
 };
 
 struct edge_t
@@ -109,10 +109,10 @@ struct graph_t
 	node_t *t;		/* sink.			*/
 	node_t *excess; /* nodes with e > 0 except s,t.	*/
     
-	pthread_mutex_t g_lock;
-	pthread_cond_t  cv;
-    int done;
-	int active_workers;
+	pthread_mutex_t g_lock; /* global lock to ensure nodes coming in and out of excess pool is consistent */
+	pthread_cond_t  cv; /* cond variable to make sure threads sleep when they're done with their job and there isn't more work to do */
+    int done; /* algorithm done flag */
+	int active_workers; /* enumerate for amount of currently active threads */
 };
 
 /* a remark about C arrays. the phrase above 'array of n nodes' is using
@@ -319,17 +319,17 @@ static int lock_edge_nodes(edge_t *a) {
     if (a->u < a->v) {
         pthread_mutex_lock(&a->u->n_lock);
         pthread_mutex_lock(&a->v->n_lock);
-        return 0;
+        return FORWARD_U_TO_V;
     } else {
         pthread_mutex_lock(&a->v->n_lock);
         pthread_mutex_lock(&a->u->n_lock);
-        return 1;
+        return BACKWARD_V_TO_U;
     }
 }
 
 static void unlock_edge_nodes(edge_t *a, int order)
 {
-   if (order == 0)
+   if (order == FORWARD_U_TO_V)
    {
            pthread_mutex_unlock(&a->v->n_lock);
            pthread_mutex_unlock(&a->u->n_lock);
@@ -399,8 +399,8 @@ static void enter_excess(graph_t *g, node_t *v)
 
     if (v == g->s || v == g->t) return;
 
-    if (!v->in_queue) {
-        v->in_queue = 1;
+    if (!v->is_in_queue) {
+        v->is_in_queue = 1;
         v->next = g->excess;
         g->excess = v;
 
@@ -417,9 +417,9 @@ static node_t *leave_excess(graph_t *g)
 	 */
     node_t* v = g->excess;
     if (v) {
+        v->is_in_queue = 0;
         g->excess = v->next;
         v->next = NULL;
-        v->in_queue = 0;
     }
     return v;
 }
@@ -481,15 +481,12 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 	unlock_edge_nodes(e, order);
 
 	/* the following are always true. */
-	/*
 	assert(d >= 0);
 	assert(u->e >= 0);
 	assert(abs(e->f) <= e->c);
-    */
 
 	if (u_excess_after_push > 0)
 	{
-		/* still some remaining so let u push more. */
 		pthread_mutex_lock(&g->g_lock);
 		enter_excess(g, u);
 		pthread_mutex_unlock(&g->g_lock);
@@ -497,11 +494,6 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 
 	if (v_excess_after_push == d)
 	{
-		/* since v has d excess now it had zero before and
-		 * can now push.
-		 *
-		 */
-
 		pthread_mutex_lock(&g->g_lock);
 		enter_excess(g, v);
 		pthread_mutex_unlock(&g->g_lock);
@@ -524,13 +516,13 @@ static void relabel(graph_t *g, node_t *u)
         int order = lock_edge_nodes(e);
         v = other(u, e);
 
-        int rescap;
+        int rf;
         if (u == e->u)
-            rescap = e->c - e->f;  // residual capacity from u -> v
+            rf = e->c - e->f;  // residual capacity from u -> v
         else
-            rescap = e->c + e->f;  // residual capacity from u <- v
+            rf = e->c + e->f;  // residual capacity from u <- v
 
-        if (rescap > 0)
+        if (rf > 0)
             min_h = MIN(min_h, v->h);
 
         unlock_edge_nodes(e, order);
@@ -543,13 +535,19 @@ static void relabel(graph_t *g, node_t *u)
         u->h += 1;          // fallback if no residual neighbors
     pthread_mutex_unlock(&u->n_lock);
 
-    /* Re-insert u into the excess worklist */
     pthread_mutex_lock(&g->g_lock);
-    enter_excess(g, u);      // make sure enter_excess checks in_queue
+    enter_excess(g, u);
     pthread_mutex_unlock(&g->g_lock);
 }
 
-void* worker(void* arg) {
+static void mark_as_done(graph_t *g) 
+{
+	g->done = 1;
+	pthread_cond_broadcast(&g->cv);
+}
+
+void* worker(void* arg)
+{
     graph_t* g = (graph_t*)arg;
     node_t* u = NULL;
     int can_push;
@@ -561,8 +559,7 @@ void* worker(void* arg) {
 		if(u == NULL) {
 			g->active_workers--;
 			if (g->active_workers == 0 && g->excess == NULL) {
-				g->done = 1;
-				pthread_cond_broadcast(&g->cv);
+				mark_as_done(g);
 				pthread_mutex_unlock(&g->g_lock);
 				return NULL;
 			}
@@ -615,7 +612,17 @@ void* worker(void* arg) {
     }
 }
 
-
+int get_opt_thread_count(void)
+{
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN); /* POSIX, but might not always work */
+    if (nprocs > 0) {
+		pr("Detecting max online threads to use: %d threads", (int)nprocs);
+        return (int)nprocs;
+    } else {
+        pr("_SC_NPROCESSORS_ONLN macro unavailable, fallback to using 4 threads");
+        return 4;
+	}
+}
 
 int preflow(graph_t *g)
 {
@@ -658,8 +665,8 @@ int preflow(graph_t *g)
 	/* then loop until only s and/or t have excess preflow. */
 
 	/* --- End of Start of algorithm, below is multi-threaded improvements */
+    int threadcount = get_opt_thread_count();
 
-	int threadcount = 6; // TODO: Optimal amount is device specific
 	pthread_t threads[threadcount];
 	g->active_workers = threadcount;
 	g->done = 0;
