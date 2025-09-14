@@ -191,12 +191,13 @@ static node_t *other(node_t *u, edge_t *e)
 Otherwise, use the safe enter_excess helper.*/
 static void enter_excess_locked(graph_t *g, node_t *v)
 {
-    if (v == g->s || v == g->t) return;
-    if (!v->is_in_queue) {
+    if (v == g->s || v == g->t) 
+		return;
+    if (!v->is_in_queue)
+	{
         v->is_in_queue = 1;
         v->next = g->excess;
         g->excess = v;
-
         pthread_cond_signal(&g->cv);
     }
 }
@@ -212,7 +213,8 @@ static void enter_excess(graph_t *g, node_t *v)
 static void *leave_excess_locked(graph_t *g)
 {
     node_t* v = g->excess;
-    if (v) {
+    if (v)
+	{
         v->is_in_queue = 0;
         g->excess = v->next;
         v->next = NULL;
@@ -236,12 +238,15 @@ static node_t *_get_next_active_node(graph_t *g)
     node_t *u = NULL;
 
     pthread_mutex_lock(&g->g_lock);
-    while (1) {
+    while (1)
+	{
         u = leave_excess_locked(g);
-        if (u != NULL) break;
+        if (u != NULL) 
+			break;
 
         g->active_workers--;
-        if (g->active_workers == 0 && g->excess == NULL) {
+        if (g->active_workers == 0 && g->excess == NULL)
+		{
             // last worker, no nodes left = algorithm done
 			g->done = 1;
 			pthread_cond_broadcast(&g->cv);
@@ -249,17 +254,18 @@ static node_t *_get_next_active_node(graph_t *g)
             return NULL;
         }
 
-		while ((u = leave_excess_locked(g)) == NULL && !g->done) {
+		while ((u = leave_excess_locked(g)) == NULL && !g->done)
             pthread_cond_wait(&g->cv, &g->g_lock);
-        }
 
         g->active_workers++;
-        if (g->done) {
+        if (g->done)
+		{
             pthread_mutex_unlock(&g->g_lock);
             return NULL;
         }
 
-        if (u != NULL) break; // we got work after wakeup
+        if (u != NULL)
+			break; // we got work after wakeup
     }
 
     pthread_mutex_unlock(&g->g_lock);
@@ -272,10 +278,13 @@ static node_t *_get_next_active_node(graph_t *g)
 
 static void lock_edge_nodes(edge_t *a) {
 	// ordering for edge locks relies on pointer ordering (safe because nodes never move) but isn't robust //kaspian
-    if (a->u < a->v) {
+    if (a->u < a->v)
+	{
         pthread_mutex_lock(&a->u->n_lock);
         pthread_mutex_lock(&a->v->n_lock);
-    } else {
+    }
+	else
+	{
         pthread_mutex_lock(&a->v->n_lock);
         pthread_mutex_lock(&a->u->n_lock);
     }
@@ -318,7 +327,7 @@ static void _push(node_t *u, node_t *v, edge_t *e, bool_t *u_is_active, bool_t *
 	v_excess_after_push = v->e;
 	unlock_edge_nodes(e);
 
-	/* the following are always true. */ //TODO: Probably remove?
+	/* the following are always true. */
 	assert(d >= 0);
 	assert(u->e >= 0);
 	assert(abs(e->f) <= e->c);
@@ -339,8 +348,10 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 	bool_t u_is_active, v_is_active;
 	_push(u, v, e, &u_is_active, &v_is_active);
 
-	if (u_is_active) enter_excess(g, u);
-	if (v_is_active) enter_excess(g, v);
+	if (u_is_active)
+		enter_excess(g, u);
+	if (v_is_active)
+		enter_excess(g, v);
 }
 
 /* REQUIRE: Caller does not hold u->n_lock or v->n_lock.
@@ -406,37 +417,49 @@ static void _discharge(graph_t *g, node_t *u)
 	node_t* v;
 	int b;
 
-	for (p = u->edge; p != NULL; p = p->next) {
+	for (p = u->edge; p != NULL; p = p->next)
+	{
 		e = p->edge;
-		if (u == e->u) { v = e->v; b = 1; }
-		else { v = e->u; b = -1; }
+		if (u == e->u)
+		{
+			v = e->v;
+			b = 1;
+		}
+		else
+		{
+			v = e->u;
+			b = -1;
+		}
 
 		lock_edge_nodes(e);
 		can_push = (u->h > v->h) && (b * e->f < e->c);
 		unlock_edge_nodes(e);
 
-		if (can_push) {
+		if (can_push)
+		{
 			push(g, u, v, e);
 			pushed = 1;
 			break; // push at most once
 		}
 	}
 
-	if (!pushed) {
+	if (!pushed)
 		relabel(g, u);
-	}
 }
 
 /* ---------------------------- */
 /*  Workers / Thread Functions  */
 /* ---------------------------- */
-int get_opt_thread_count(void)
+static int get_opt_thread_count(void)
 {
-    long nprocs = sysconf(_SC_NPROCESSORS_ONLN); /* POSIX, but won't not always work */
-    if (nprocs > 0) {
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN); /* POSIX, so won't work on every device */
+    if (nprocs > 0)
+	{
 		pr("Detecting max online threads to use: %d threads", (int)nprocs);
         return (int)nprocs;
-    } else {
+    }
+	else
+	{
         pr("_SC_NPROCESSORS_ONLN macro unavailable, fallback to using 4 threads");
         return 4;
 	}
@@ -447,9 +470,11 @@ void *worker(void* arg)
     graph_t* g = (graph_t*)arg;
     node_t* u = NULL;
 
-    while (1) {
+    while (1)
+	{
 		u = _get_next_active_node(g);
-		if (!u) break;
+		if (!u)
+			break;
 
 		_discharge(g, u);
     }
@@ -460,8 +485,10 @@ static void init_workers(graph_t *g, pthread_t *threads, int threadcount)
 	g->active_workers = threadcount;
 	g->done = 0;
 
-	for(int i = 0; i < threadcount; i++) {
-		if (pthread_create(&threads[i], NULL, worker, g) != 0) {
+	for(int i = 0; i < threadcount; i+=1)
+	{
+		if (pthread_create(&threads[i], NULL, worker, g) != 0)
+		{
 		    error("pthread_create");
 		    exit(1);
 		}
@@ -469,7 +496,7 @@ static void init_workers(graph_t *g, pthread_t *threads, int threadcount)
 }
 
 static void join_workers(pthread_t *threads, int threadcount) {
-    for (int i = 0; i < threadcount; i++)
+    for (int i = 0; i < threadcount; i+=1)
         pthread_join(threads[i], NULL);
 }
 
@@ -479,25 +506,23 @@ static void join_workers(pthread_t *threads, int threadcount) {
 
 void init_mutexes(graph_t *g)
 {
+	int i;
+
 	pthread_mutex_init(&g->g_lock, NULL);
 	pthread_cond_init(&g->cv, NULL);
 	g->done = 0;
-
-	for(int i = 0; i < g->n; i+=1)
-	{
+	for(i = 0; i < g->n; i+=1)
 		pthread_mutex_init(&g->v[i].n_lock, NULL);
-	}
 }
 
 void destroy_mutexes(graph_t *g)
 {
+	int i;
+
 	pthread_mutex_destroy(&g->g_lock);
 	pthread_cond_destroy(&g->cv);
-
-	for(int i = 0; i < g->n; i+=1)
-	{
+	for(i = 0; i < g->n; i+=1)
 		pthread_mutex_destroy(&g->v[i].n_lock);
-	}
 }
 
 static graph_t *new_graph(FILE *in, int n, int m)
@@ -559,26 +584,28 @@ static void free_graph(graph_t *g)
 
 static void init_preflow(graph_t *g)
 {
+	list_t *p;
+	edge_t *e;
 	node_t *s = g->s;
+
     s->h = g->n;
     s->e = 0;
 
-    for (list_t *p = s->edge; p != NULL; p = p->next) {
-        edge_t *e = p->edge;
+    for (p = s->edge; p != NULL; p = p->next)
+	{
+        e = p->edge;
         s->e += e->c;
     }
 
-    for (list_t *p = s->edge; p != NULL; p = p->next) {
+	for (p = s->edge; p != NULL; p = p->next)
         push(g, s, other(s, p->edge), p->edge);
-    }
 }
 
 static void wait_for_finish(graph_t *g)
 {
 	pthread_mutex_lock(&g->g_lock);
-	while(!g->done) {
+	while(!g->done)
 		pthread_cond_wait(&g->cv, &g->g_lock);
-	}
 	pthread_mutex_unlock(&g->g_lock);
 }
 
@@ -611,7 +638,7 @@ static void preflow(preflow_context_t *algo_ctx)
 /* ---------------------------------- */
 int main(int argc, char *argv[])
 {
-	int tc; /* algorith threadcount */
+	int tc;     /* algorith threadcount */
 	FILE *in;	/* input file set to stdin	*/
 	graph_t *g; /* undirected graph. 		*/
 	int f;		/* output from preflow.		*/
