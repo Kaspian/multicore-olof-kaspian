@@ -191,7 +191,7 @@ static node_t *other(node_t *u, edge_t *e)
 Otherwise, use the safe enter_excess helper.*/
 static void enter_excess_locked(graph_t *g, node_t *v)
 {
-    if (v == g->s || v == g->t) 
+    if (v == g->s || v == g->t)
 		return;
     if (!v->is_in_queue)
 	{
@@ -241,7 +241,7 @@ static node_t *_get_next_active_node(graph_t *g)
     while (1)
 	{
         u = leave_excess_locked(g);
-        if (u != NULL) 
+        if (u != NULL)
 			break;
 
         g->active_workers--;
