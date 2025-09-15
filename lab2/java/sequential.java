@@ -16,12 +16,108 @@ class PreflowThread extends Thread {
 		this.g = g;
 	}
 
-	@Override
-	public void run() {
-		while (true) {
+	void pushCore(Node u, Node v, Edge a) {
+		PushResult r = new PushResult();
+		
+	}
 
+	void push(Node u, Node v, Edge a) {
+		PushResult r = pushCore(u, v, a);
+		if (r.uActive) {
+			g.enterExcess(u);
+		}
+		if (r.vActive) {
+			g.enterExcess(v);
 		}
 	}
+
+	/* REQUIRE: Caller must not hold the global lock*/
+	private Node get_next_active_node() {
+		Node u;
+
+		g.gLock.lock();
+		while(true) {
+			u = g.leaveExcessLocked();
+			if(u != null) break;
+
+			g.activeWorkers -= 1;
+			if(g.activeWorkers == 0 && g.excess == null) {
+				g.done = 1;
+				g.cv.signalAll();
+				g.gLock.unlock();
+				return null;
+			}
+
+			while ((u = g.leaveExcessLocked()) == null && !g.done) {
+				g.gLock.lock();
+				try {
+					g.cv.await();
+				} finally {
+					g.gLock.unlock();
+				}
+			}
+
+        	g->active_workers++;
+			if (g.done) {
+				g.gLock.unlock();
+				return null;
+			}
+
+			if(u != null) {
+				break;
+			}
+		}
+		g.gLock.unlock();
+		return u;
+	}
+
+	private void discharge(Node u) {
+		boolean pushed   = false;
+		boolean canPush = false;
+		ListIterator<Edge> iter;
+		Edge e;
+		Node v;
+		int b;
+
+		iter = u.adj.listIterator();		
+		while(iter.hasNext()) {
+			Edge e = iter.next();
+
+			if(u == e.u) {
+				v = e.v;
+				b = 1;
+			} else {
+				v = e.u;
+				b = -1;
+			}
+
+			e.lockEdgeNodes();
+			canPush = (u.h > v.h) && (b * e.f < f.c);
+			e.lockEdgeNodes();
+
+			if(canPush) {
+				push(g, u, v, e);
+			}
+		}
+	}
+
+	@Override
+	public void run() {
+		Node u;
+
+		while (true) {
+			u = get_active_active_node();
+			if(!u) {
+				break;
+			}
+			discharge(u);
+		}
+	}
+}
+
+class PushResult {
+	public boolean uActive = false;
+	public boolean vActive = false;
 }
 
 class Graph {
@@ -46,7 +142,7 @@ class Graph {
 		this.m = edge.length;
 	}
 
-	void enterExcess(Node u) {
+	public void enterExcess(Node u) {
 		gLock.lock();
 		try {
 			enterExcessLocked(u);
@@ -55,7 +151,8 @@ class Graph {
 		}
 	}
 
-	private void enterExcessLocked(Node u) {
+	/* REQUIRE: Must hold global lock before calling this. */
+	public void enterExcessLocked(Node u) {
 		if (u == node[s] || u == node[t])
 			return;
 		if (!u.inQueue) {
@@ -64,6 +161,29 @@ class Graph {
 			excess = u;
 			gCond.signal();
 		}
+	}
+
+	/* REQUIRE: Must hold global lock before calling this. */
+	public Node leaveExcessLocked() {
+		Node u = excess
+		if(u != null) {
+			u.inQueue = false;
+			excess = u.next;
+			u.next = null;
+		}
+		return u;
+	}
+
+	public Node leaveExcess() {
+		Node u;
+
+		gLock.lock();
+		try {
+			u = leaveExcessLocked();
+		} finally {
+			gLock.unlock();
+		}
+		return u;
 	}
 
 	Node other(Edge a, Node u) {
@@ -75,10 +195,6 @@ class Graph {
 
 	void relabel(Node u) {
 		u.relabel();
-	}
-
-	void push(Node u, Node v, Edge a) {
-
 	}
 
 	int newPreflow(int s, int t, Thread[] threads) {
@@ -243,6 +359,23 @@ class Edge {
 		this.v = v;
 		this.c = c;
 
+	}
+
+	/* REQUIRE: Must not hold either lock when calling this function */
+	public void lockEdgeNodes() {
+		if (u.i < v.i) {
+			u.nLock.lock();
+			v.nLock.lock();
+		} else {
+			v.nLock.lock();
+			u.nLock.lock();
+		}
+	}
+
+	/* REQUIRE: Must hold both lock when calling this function */
+	public void unlockEdgeNodes() {
+		u.nLock.unlock();
+		v.nLock.unlock();
 	}
 }
 
