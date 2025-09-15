@@ -1,60 +1,184 @@
 import java.util.Scanner;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.Condition;
+
 import java.util.Iterator;
 import java.util.ListIterator;
 import java.util.LinkedList;
+import java.lang.Thread;
 
 import java.io.*;
 
-class Graph {
+class PreflowThread extends Thread {
+	private final Graph g;
 
-	int	s;
-	int	t;
-	int	n;
-	int	m;
-	Node	excess;		// list of nodes with excess preflow
-	Node	node[];
-	Edge	edge[];
-
-	Graph(Node node[], Edge edge[])
-	{
-		this.node	= node;
-		this.n		= node.length;
-		this.edge	= edge;
-		this.m		= edge.length;
+	PreflowThread(Graph g) {
+		this.g = g;
 	}
 
-	void enter_excess(Node u)
-	{
-		if (u != node[s] && u != node[t]) {
-			u.next = excess;
-			excess = u;
+	@Override
+	public void run() {
+		while (true) {
+
+		}
+	}
+}
+
+class Graph {
+
+	int s;
+	int t;
+	int n;
+	int m;
+	int activeWorkers;
+	boolean done;
+	Thread threads[];
+	Node excess; // list of nodes with excess preflow
+	Node node[];
+	Edge edge[];
+	ReentrantLock gLock;
+	Condition gCond;
+
+	Graph(Node node[], Edge edge[]) {
+		this.node = node;
+		this.n = node.length;
+		this.edge = edge;
+		this.m = edge.length;
+	}
+
+	void enterExcess(Node u) {
+		gLock.lock();
+		try {
+			enterExcessLocked(u);
+		} finally {
+			gLock.unlock();
 		}
 	}
 
-	Node other(Edge a, Node u)
-	{
-		if (a.u == u)	
+	private void enterExcessLocked(Node u) {
+		if (u == node[s] || u == node[t])
+			return;
+		if (!u.inQueue) {
+			u.inQueue = true;
+			u.next = excess;
+			excess = u;
+			gCond.signal();
+		}
+	}
+
+	Node other(Edge a, Node u) {
+		if (a.u == u)
 			return a.v;
 		else
 			return a.u;
 	}
 
-	void relabel(Node u)
-	{
+	void relabel(Node u) {
+		u.relabel();
 	}
 
-	void push(Node u, Node v, Edge a)
-	{
+	void push(Node u, Node v, Edge a) {
+
 	}
 
-	int preflow(int s, int t)
-	{
-		ListIterator<Edge>	iter;
-		int			b;
-		Edge			a;
-		Node			u;
-		Node			v;
-		
+	int newPreflow(int s, int t, Thread[] threads) {
+		this.s = s;
+		this.t = t;
+		this.threads = threads;
+
+		setup();
+
+		waitForFinish();
+
+		teardown();
+
+		return 0;
+
+	}
+
+	void setup() {
+		initMutexes();
+		initPreflow();
+		initWorkers();
+	}
+
+	void initMutexes() {
+		this.gLock = new ReentrantLock();
+		this.gCond = gLock.newCondition();
+		for (Node n : node) {
+			n.nLock = new ReentrantLock();
+		}
+	}
+
+	void initPreflow() {
+		ListIterator<Edge> iter;
+		Edge a;
+
+		node[s].h = n;
+
+		iter = node[s].adj.listIterator();
+		while (iter.hasNext()) {
+			a = iter.next();
+
+			node[s].e += a.c;
+
+			push(node[s], other(a, node[s]), a);
+		}
+	}
+
+	void initWorkers() {
+		activeWorkers = threads.length;
+		this.done = false;
+		Thread thread;
+		for (int i = 0; i < threads.length; i++) {
+			thread = new PreflowThread(g);
+			threads[i] = thread;
+			thread.start();
+		}
+
+	}
+
+	void waitForFinish() {
+		gLock.lock();
+		try {
+			while (!done) {
+				gCond.await(); // handles spurious wakeups
+			}
+		} catch (InterruptedException ie) {
+			Thread.currentThread().interrupt();
+		} finally {
+			gLock.unlock();
+		}
+	}
+
+	void signalDone() {
+		gLock.lock();
+		try {
+			done = true;
+			gCond.signalAll();
+		} finally {
+			gLock.unlock();
+		}
+	}
+
+	void teardown() {
+		for (Thread th : threads) {
+			try {
+				th.join();
+			} catch (InterruptedException ie) {
+				Thread.currentThread().interrupt(); // If interrupted, stop trying to join the rest
+				break;
+			}
+		}
+	}
+
+	int preflow(int s, int t) {
+		ListIterator<Edge> iter;
+		int b;
+		Edge a;
+		Node u;
+		Node v;
+
 		this.s = s;
 		this.t = t;
 		node[s].h = n;
@@ -90,27 +214,31 @@ class Graph {
 }
 
 class Node {
-	int	h;
-	int	e;
-	int	i;
-	Node	next;
-	LinkedList<Edge>	adj;
+	int h;
+	int e;
+	int i;
+	boolean inQueue = false;
+	Node next;
+	LinkedList<Edge> adj;
+	ReentrantLock nLock;
 
-	Node(int i)
-	{
+	Node(int i) {
 		this.i = i;
 		adj = new LinkedList<Edge>();
+	}
+
+	public void relabel() {
+		this.h += 1;
 	}
 }
 
 class Edge {
-	Node	u;
-	Node	v;
-	int	f;
-	int	c;
+	Node u;
+	Node v;
+	int f;
+	int c;
 
-	Edge(Node u, Node v, int c)
-	{
+	Edge(Node u, Node v, int c) {
 		this.u = u;
 		this.v = v;
 		this.c = c;
@@ -119,18 +247,21 @@ class Edge {
 }
 
 class Preflow {
-	public static void main(String args[])
-	{
-		double	begin = System.currentTimeMillis();
+	private static int threadCount = 8;
+
+	private static Thread[] threads = new Thread[threadCount];
+
+	public static void main(String args[]) {
+		double begin = System.currentTimeMillis();
 		Scanner s = new Scanner(System.in);
-		int	n;
-		int	m;
-		int	i;
-		int	u;
-		int	v;
-		int	c;
-		int	f;
-		Graph	g;
+		int n;
+		int m;
+		int i;
+		int u;
+		int v;
+		int c;
+		int f;
+		Graph g;
 
 		n = s.nextInt();
 		m = s.nextInt();
@@ -145,15 +276,16 @@ class Preflow {
 		for (i = 0; i < m; i += 1) {
 			u = s.nextInt();
 			v = s.nextInt();
-			c = s.nextInt(); 
+			c = s.nextInt();
 			edge[i] = new Edge(node[u], node[v], c);
 			node[u].adj.addLast(edge[i]);
 			node[v].adj.addLast(edge[i]);
 		}
 
 		g = new Graph(node, edge);
-		f = g.preflow(0, n-1);
-		double	end = System.currentTimeMillis();
+
+		f = g.preflow(0, n - 1, threads);
+		double end = System.currentTimeMillis();
 		System.out.println("t = " + (end - begin) / 1000.0 + " s");
 		System.out.println("f = " + f);
 	}
