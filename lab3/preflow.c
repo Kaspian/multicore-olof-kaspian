@@ -14,7 +14,7 @@
 /*  Program Constants & Types   */
 /* ---------------------------- */
 
-#define PRINT 1 /* enable/disable prints. */
+#define PRINT 0 /* enable/disable prints. */
 #define MIN(a, b) (((a) <= (b)) ? (a) : (b))
 
 typedef int bool_t;
@@ -104,7 +104,8 @@ struct preflow_context_t
 {
 	graph_t *g;
 	pthread_t *threads;
-	pthread_barrier_t barrier;
+	pthread_barrier_t *barrier;
+	thread_ctx_t *thread_ctxs;
 	int threadcount;
 	int result; // Will be equal to the sinks final excess
 };
@@ -227,7 +228,6 @@ static void enter_excess_locked(graph_t *g, node_t *v)
 		v->is_in_queue = 1;
 		v->next = g->excess;
 		g->excess = v;
-		pthread_cond_signal(&g->cv);
 	}
 }
 
@@ -305,48 +305,6 @@ static void init_push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 	enter_excess(g, v);
 }
 
-/* REQUIRE: Caller does not hold g->g_lock.
- * This function locks/unlocks global lock internally.
- */
-static node_t *_get_next_active_node(graph_t *g)
-{
-	node_t *u = NULL;
-
-	pthread_mutex_lock(&g->g_lock);
-	while (1)
-	{
-		u = leave_excess_locked(g);
-		if (u != NULL)
-			break;
-
-		g->active_workers--;
-		if (g->active_workers == 0 && g->excess == NULL)
-		{
-			// last worker, no nodes left = algorithm done
-			g->done = 1;
-			pthread_cond_broadcast(&g->cv);
-			pthread_mutex_unlock(&g->g_lock);
-			return NULL;
-		}
-
-		while ((u = leave_excess_locked(g)) == NULL && !g->done)
-			pthread_cond_wait(&g->cv, &g->g_lock);
-
-		g->active_workers++;
-		if (g->done)
-		{
-			pthread_mutex_unlock(&g->g_lock);
-			return NULL;
-		}
-
-		if (u != NULL)
-			break; // we got work after wakeup
-	}
-
-	pthread_mutex_unlock(&g->g_lock);
-	return u;
-}
-
 /* ---------------------------- */
 /*  Preflow Algorithm Helpers   */
 /* ---------------------------- */
@@ -358,7 +316,6 @@ static void _push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 
 	update_t update;
 	update.type = 0;
-	update.new_height = 0;
 
 	if (u == e->u)
 	{
@@ -378,6 +335,7 @@ static void _push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 	u->e -= d;
 
 	size_t index = ctx->count;
+	update.new_height = u->h;
 	update.delta = d;
 	ctx->plq[index] = update;
 	ctx->count++;
@@ -472,16 +430,21 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 	for (p = u->edge; p != NULL; p = p->next)
 	{
 		e = p->edge;
-		if (u == e->u)
-		{
-			v = e->v;
-			b = 1;
-		}
-		else
-		{
-			v = e->u;
-			b = -1;
-		}
+
+		bool_t is_forward = (u == e->u);
+		v = is_forward ? e->v : e->u;
+		b = is_forward ? 1 : -1;
+
+		// if (u == e->u)
+		// {
+		// 	v = e->v;
+		// 	b = 1;
+		// }
+		// else
+		// {
+		// 	v = e->u;
+		// 	b = -1;
+		// }
 
 		can_push = (u->h > v->h) && (b * e->f < e->c);
 
@@ -539,11 +502,13 @@ static void _apply_updates(thread_ctx_t *ctx)
 	{
 		thread_ctx_t *thread_ctx = &all_thread_contexts[i];
 		update_t update;
+
 		for (k = 0; k < thread_ctx->count; k++)
 		{
 			update = thread_ctx->plq[k];
 			if (update.type == 0)
 			{
+				pr("We are updating %d, with delta: %d", id(thread_ctx->g, update.u), update.delta);
 				update.u->e += update.delta;
 			}
 			else if (update.type == 1)
@@ -555,7 +520,7 @@ static void _apply_updates(thread_ctx_t *ctx)
 				error("ERROR");
 			}
 
-			enter_excess(thread_ctx->g, update.u);
+			enter_excess(ctx->g, update.u);
 		}
 		thread_ctx->count = 0;
 	}
@@ -569,14 +534,15 @@ void *worker(void *arg)
 	node_t *u = NULL;
 	while (1)
 	{
-		if(g->done == 1) {
+		bool_t done = g->done;
+
+		if(done == 1) {
 			pr("The loop finishes.");
 			break;
 		}
 
 		u = leave_excess(g);
 
-		//u = _get_next_active_node(g);
 		if (u){
 			tctx->did_work = 1;
 			_build_update_queue(tctx, u);
@@ -590,26 +556,22 @@ void *worker(void *arg)
 		{
 			bool_t algo_done = 1;
 			for(int i = 0; i < tctx->all_thread_ctx_size; i++) {
-				pr("Thread %d, Is On Status: %d\n", tctx->all_thread_ctx[i].tid, tctx->all_thread_ctx[i].did_work);
+				//pr("Thread %d, Is On Status: %d\n", tctx->all_thread_ctx[i].tid, tctx->all_thread_ctx[i].did_work);
 				if(tctx->all_thread_ctx[i].did_work != 0) {
 					algo_done = 0;
 				}
 			}
 			if(algo_done) {
-				pr("We get there");
+				//pr("We get there");
 				g->done = 1;
-				pr("We are chainging this.");
+				//pr("We are chainging this.");
 			} else {
 				_apply_updates(tctx);
 			}
 		}
 
 		pthread_barrier_wait(tctx->barrier);
-		// BARRIER STOP:
-		// THREADS WAIT ON A COND VARIABLE, SAME AS BEFORE
 	}
-
-	return NULL;
 }
 
 static void init_workers(preflow_context_t *algo)
@@ -619,6 +581,7 @@ static void init_workers(preflow_context_t *algo)
 	int threadcount = algo->threadcount;
 
 	thread_ctx_t *g_plq = (thread_ctx_t *)xcalloc(threadcount, sizeof(thread_ctx_t));
+	algo->thread_ctxs = g_plq; // <== add this
 	g->active_workers = threadcount;
 	g->done = 0;
 
@@ -630,7 +593,7 @@ static void init_workers(preflow_context_t *algo)
 		g_plq[i].g = g;
 		g_plq[i].plq = thread_out_q;
 		// Hacky fixa snyggt sen
-		g_plq[i].barrier = &algo->barrier;
+		g_plq[i].barrier = algo->barrier;
 		g_plq[i].tid = i;
 		g_plq[i].count = 0;
 
@@ -703,13 +666,14 @@ static graph_t *new_graph(FILE *in, int n, int m)
 	return g;
 }
 
-static void free_ctx(thread_ctx_t *ctx, int threadcount)
+static void free_ctx(preflow_context_t *algo)
 {
-	for (int i = 0; i < threadcount; i += 1)
+	for (int i = 0; i < algo->threadcount; i += 1)
 	{
-		free(ctx[i].plq);
+		free(algo->thread_ctxs[i].plq);  // Free per-thread update queue
 	}
-	free(ctx);
+
+	free(algo->thread_ctxs);  // Free thread_ctx array itself
 }
 
 static void free_graph(graph_t *g)
@@ -752,21 +716,13 @@ static void init_preflow(graph_t *g)
 		init_push(g, s, other(s, p->edge), p->edge);
 }
 
-static void wait_for_finish(graph_t *g)
-{
-	pthread_mutex_lock(&g->g_lock);
-	while (!g->done)
-		pthread_cond_wait(&g->cv, &g->g_lock);
-	pthread_mutex_unlock(&g->g_lock);
-}
-
 static void setup(preflow_context_t *algo_ctx)
 {
 	graph_t *g = algo_ctx->g;
 
 	init_mutexes(g);
 	init_preflow(g);
-	pthread_barrier_init(&algo_ctx->barrier, NULL, algo_ctx->threadcount);
+	pthread_barrier_init(algo_ctx->barrier, NULL, algo_ctx->threadcount);
 	init_workers(algo_ctx);
 }
 
@@ -774,17 +730,17 @@ static void teardown(preflow_context_t *algo_ctx)
 {
 	graph_t *g = algo_ctx->g;
 
-	destroy_mutexes(g);
-	int ret = pthread_barrier_destroy(&algo_ctx->barrier);
-	join_workers(algo_ctx->threads, algo_ctx->threadcount);
+	free_ctx(algo_ctx);  // Now safe to free thread contexts
+	pthread_barrier_destroy(algo_ctx->barrier);
+	destroy_mutexes(algo_ctx->g);
 }
 
 static void preflow(preflow_context_t *algo_ctx)
 {
 	setup(algo_ctx);
 
+	join_workers(algo_ctx->threads, algo_ctx->threadcount);
 	// UPDATE GRAPHS LOOP
-	wait_for_finish(algo_ctx->g);
 
 	algo_ctx->result = algo_ctx->g->t->e;
 	teardown(algo_ctx);
@@ -824,7 +780,7 @@ int main(int argc, char *argv[])
 	algo.g = g;
 	algo.threadcount = tc;
 	algo.threads = threads;
-	algo.barrier = barrier;
+	algo.barrier = &barrier;
 
 	preflow(&algo);
 	f = algo.result;
