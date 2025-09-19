@@ -356,31 +356,33 @@ static void _push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 	int d; /* remaining capacity of the edge. */
 	int u_excess_after_push, v_excess_after_push;
 
+	update_t update;
+	update.type = 0;
+	update.new_height = 0;
+
 	if (u == e->u)
 	{
 		d = MIN(u->e, e->c - e->f);
 		e->f += d;
 		pr("d: %d ::", d);
+		update.u = e->v;
 	}
 	else
 	{
 		d = MIN(u->e, e->c + e->f);
 		e->f -= d;
 		pr("d: -%d ::", d);
+		update.u = e->u;
 	}
 	pr("pushing %d\n", d);
 	u->e -= d;
 
-	/* --- */
 	size_t index = ctx->count;
-
-	update_t update;
-	update.type = 0;
-	update.u = e->v;
 	update.delta = d;
-	update.new_height = 0;
 	ctx->plq[index] = update;
 	ctx->count++;
+
+	/* --- */
 
 	/* the following are always true. */
 	assert(d >= 0);
@@ -436,7 +438,7 @@ static int _relabel(int min_h, node_t *u)
 	if (min_h < INT_MAX)
 		return min_h + 1;
 	else
-		return 1;
+		return u->h + 1;
 }
 
 static void relabel(thread_ctx_t *ctx, node_t *u)
@@ -446,13 +448,12 @@ static void relabel(thread_ctx_t *ctx, node_t *u)
 	int h = _relabel(min_h, u);
 
 	update_t update;
-	update.type = 1;
+	update.type = 1;              // 1 == RELABEL
 	update.u = u;
-	update.delta = 0;
-	update.new_height = update.u->h += h;
-	size_t index = ctx->count;
-	ctx->plq[index] = update;
-	ctx->count++;
+	update.delta = 0;             // delta not needed for relabel?
+	update.new_height = h;
+
+	ctx->plq[ctx->count++] = update;
 
 	/* CONTINUE FROM HERE LATER */
 
@@ -497,14 +498,13 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 	}
 	else if (u->e > 0)
 	{
-
 		size_t index = ctx->count;
 
 		update_t update;
 		update.type = 0;
 		update.u = u;
 		update.delta = 0;
-		update.new_height = 0;
+		update.new_height = u->h;
 		ctx->plq[index] = update;
 		ctx->count++;
 	}
@@ -548,7 +548,7 @@ static void _apply_updates(thread_ctx_t *ctx)
 			}
 			else if (update.type == 1)
 			{
-				update.u->h += update.new_height;
+				update.u->h = update.new_height;
 			}
 			else
 			{
@@ -577,6 +577,7 @@ void *worker(void *arg)
 			_build_update_queue(tctx, u);
 		} else {
 			tctx->did_work = 0;
+			pr("We have no work to do");
 		}
 
 		pthread_barrier_wait(tctx->barrier);
