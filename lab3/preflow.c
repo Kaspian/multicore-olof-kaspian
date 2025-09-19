@@ -14,7 +14,7 @@
 /*  Program Constants & Types   */
 /* ---------------------------- */
 
-#define PRINT 0 /* enable/disable prints. */
+#define PRINT 1 /* enable/disable prints. */
 #define MIN(a, b) (((a) <= (b)) ? (a) : (b))
 
 typedef int bool_t;
@@ -47,12 +47,7 @@ static char *progname;
 #define pr(...) /* no effect at all */
 #endif
 
-#if PRINT
-static int id(graph_t *g, node_t *v)
-{
-	return v - g->v;
-}
-#endif
+
 
 /* ---------------------------- */
 /*  Algorithm Structs           */
@@ -98,6 +93,12 @@ struct graph_t
 	int done;				/* algorithm done flag */
 	int active_workers;		/* enumerate for amount of currently active threads */
 };
+#if PRINT
+static int id(graph_t *g, node_t *v)
+{
+	return v - g->v;
+}
+#endif
 
 struct preflow_context_t
 {
@@ -127,6 +128,8 @@ struct thread_ctx_t
 
 	thread_ctx_t *all_thread_ctx;
 	size_t all_thread_ctx_size;
+
+	bool_t did_work;
 	pthread_barrier_t *barrier;
 };
 
@@ -230,7 +233,9 @@ static void enter_excess_locked(graph_t *g, node_t *v)
 
 static void enter_excess(graph_t *g, node_t *v)
 {
+	pthread_mutex_lock(&g->g_lock);
 	enter_excess_locked(g, v);
+	pthread_mutex_unlock(&g->g_lock);
 }
 
 /* REQUIRE: The global lock (g->g_lock) MUST be held before calling this function. */
@@ -571,24 +576,41 @@ void *worker(void *arg)
 	node_t *u = NULL;
 	while (1)
 	{
-		u = _get_next_active_node(g);
-		if (!u)
-			break;
+		u = leave_excess(g);
 
-		_build_update_queue(tctx, u);
+		//u = _get_next_active_node(g);
+		if (u){
+			tctx->did_work = 1;
+			_build_update_queue(tctx, u);
+		} else {
+			tctx->did_work = 0;
+		}
+
 		pthread_barrier_wait(tctx->barrier);
 
 		if (tctx->tid == 0) // Special Thread 0
 		{
-			/* TODO NEXT: We need to store the amount of threads
-			in the tctx? It's getting confusing.*/
-			_apply_updates(tctx);
+			bool_t algo_done = 1;
+			for(int i = 0; i < tctx->all_thread_ctx_size; i++) {
+				if(tctx->all_thread_ctx[i].did_work != 1) {
+					algo_done = 0;
+				}
+			}
+			if(algo_done) {
+				g->done = 1;
+				pthread_cond_broadcast(&g->cv);
+				pthread_mutex_unlock(&g->g_lock);
+				return NULL;
+			} else {
+				_apply_updates(tctx);
+			}
 		}
 
 		pthread_barrier_wait(tctx->barrier);
 		// BARRIER STOP:
 		// THREADS WAIT ON A COND VARIABLE, SAME AS BEFORE
 	}
+
 	return NULL;
 }
 
