@@ -222,8 +222,8 @@ class Graph {
 		}
 	}
 
-	void signalDone() {
-		gLock.lock();
+	/* REQUIRE: Must hold global lock when called. */
+	void signalDoneLocked() {
 		try {
 			done = true;
 			gCond.signalAll();
@@ -297,9 +297,7 @@ class Graph {
 			activeWorkers--;
 
 			if (activeWorkers == 0 && excess == null) {
-				done = true;
-				gCond.signalAll();
-				gLock.unlock();
+				signalDoneLocked();
 				return null;
 			}
 

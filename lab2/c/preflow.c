@@ -348,9 +348,11 @@ static void push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 	bool_t u_is_active, v_is_active;
 	_push(u, v, e, &u_is_active, &v_is_active);
 
+	// BARRIER 
+
 	if (u_is_active)
 		enter_excess(g, u);
-	if (v_is_active)
+	if (v_is_active) /* LIST OF V */
 		enter_excess(g, v);
 }
 
@@ -405,9 +407,63 @@ static void relabel(graph_t *g, node_t *u)
     enter_excess(g, u);
 }
 
-/* REQUIRE: Caller does not hold u->n_lock, v->n_lock OR g->g_lock.
+typedef struct {
+	node_t* relabels;
+	node_t* pushes;
+	int     pushes_e;
+	size_t relabels_size;
+	size_t pushes_size;
+} push_relabel_queue_t;
+
+static void _build_push_relabel_queue(graph_t *g, push_relabel_queue_t* plq)
+{
+	assert(plq->relabels_size == 0)
+	assert(plq->pushes_size   == 0)
+
+	bool_t can_push = 0;
+	bool_t should_relabel = 1;
+
+	list_t* p;
+	edge_t* e;
+	node_t* v;
+	int b;
+
+	for (p = u->edge; p != NULL; p = p->next)
+	{
+		e = p->edge;
+		if (u == e->u)
+		{
+			v = e->v;
+			b = 1;
+		}
+		else
+		{
+			v = e->u;
+			b = -1;
+		}
+
+		//lock_edge_nodes(e);
+		can_push = (u->h > v->h) && (b * e->f < e->c);
+		//unlock_edge_nodes(e);
+
+		if(can_push)
+		{
+			should_relabel = 0;
+			/* These may push, so we add this to the push queue. */
+			pushes[pushes_size] = u;
+			pushes_e[pushes_size] = //
+
+			d = MIN(u->e, e->c - e->f);
+			e->f += d;
+			pushes_size += 1;
+		}
+	}
+}
+
+
+/* Keeping for reference, the thread based approach.
+ * REQUIRE: Caller does not hold u->n_lock, v->n_lock OR g->g_lock.
  * This function locks/unlocks global lock and edge nodes internally.
- */
 static void _discharge(graph_t *g, node_t *u)
 {
 	bool_t pushed = 0;
@@ -446,6 +502,7 @@ static void _discharge(graph_t *g, node_t *u)
 	if (!pushed)
 		relabel(g, u);
 }
+*/
 
 /* ---------------------------- */
 /*  Workers / Thread Functions  */
@@ -476,7 +533,9 @@ void *worker(void* arg)
 		if (!u)
 			break;
 
+		// Barrier Lock
 		_discharge(g, u);
+		// Barrier Lock
     }
 }
 

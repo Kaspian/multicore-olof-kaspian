@@ -569,6 +569,11 @@ void *worker(void *arg)
 	node_t *u = NULL;
 	while (1)
 	{
+		if(g->done == 1) {
+			pr("The loop finishes.");
+			break;
+		}
+
 		u = leave_excess(g);
 
 		//u = _get_next_active_node(g);
@@ -577,7 +582,6 @@ void *worker(void *arg)
 			_build_update_queue(tctx, u);
 		} else {
 			tctx->did_work = 0;
-			pr("We have no work to do");
 		}
 
 		pthread_barrier_wait(tctx->barrier);
@@ -586,15 +590,15 @@ void *worker(void *arg)
 		{
 			bool_t algo_done = 1;
 			for(int i = 0; i < tctx->all_thread_ctx_size; i++) {
-				if(tctx->all_thread_ctx[i].did_work != 1) {
+				pr("Thread %d, Is On Status: %d\n", tctx->all_thread_ctx[i].tid, tctx->all_thread_ctx[i].did_work);
+				if(tctx->all_thread_ctx[i].did_work != 0) {
 					algo_done = 0;
 				}
 			}
 			if(algo_done) {
+				pr("We get there");
 				g->done = 1;
-				pthread_cond_broadcast(&g->cv);
-				pthread_mutex_unlock(&g->g_lock);
-				return NULL;
+				pr("We are chainging this.");
 			} else {
 				_apply_updates(tctx);
 			}
