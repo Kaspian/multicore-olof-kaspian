@@ -281,10 +281,6 @@ static void _init_push(node_t *u, node_t *v, edge_t *e, bool_t *u_is_active, boo
 	u->e -= d;
 	v->e += d;
 
-	// Save these to prevent potential races between unlocking and checking below
-	u_excess_after_push = u->e;
-	v_excess_after_push = v->e;
-
 	/* the following are always true. */
 	assert(d >= 0);
 	assert(u->e >= 0);
@@ -306,10 +302,7 @@ static void init_push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 	bool_t u_is_active, v_is_active;
 	_init_push(u, v, e, &u_is_active, &v_is_active);
 
-	if (u_is_active)
-		enter_excess(g, u);
-	if (v_is_active)
-		enter_excess(g, v);
+	enter_excess(g, v);
 }
 
 /* REQUIRE: Caller does not hold g->g_lock.
@@ -383,7 +376,7 @@ static void _push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 
 	update_t update;
 	update.type = 0;
-	update.u = u;
+	update.u = e->v;
 	update.delta = d;
 	update.new_height = 0;
 	ctx->plq[index] = update;
@@ -443,7 +436,7 @@ static int _relabel(int min_h, node_t *u)
 	if (min_h < INT_MAX)
 		return min_h + 1;
 	else
-		return u->h + 1;
+		return 1;
 }
 
 static void relabel(thread_ctx_t *ctx, node_t *u)
@@ -456,7 +449,7 @@ static void relabel(thread_ctx_t *ctx, node_t *u)
 	update.type = 1;
 	update.u = u;
 	update.delta = 0;
-	update.new_height = h;
+	update.new_height = update.u->h += h;
 	size_t index = ctx->count;
 	ctx->plq[index] = update;
 	ctx->count++;
@@ -544,11 +537,11 @@ static void _apply_updates(thread_ctx_t *ctx)
 
 	for (i = 0; i < all_thread_contexts_size; i++)
 	{
-		thread_ctx_t thread_ctx = all_thread_contexts[i];
+		thread_ctx_t *thread_ctx = &all_thread_contexts[i];
 		update_t update;
-		for (k = 0; k < thread_ctx.count; k++)
+		for (k = 0; k < thread_ctx->count; k++)
 		{
-			update = thread_ctx.plq[k];
+			update = thread_ctx->plq[k];
 			if (update.type == 0)
 			{
 				update.u->e += update.delta;
@@ -562,9 +555,9 @@ static void _apply_updates(thread_ctx_t *ctx)
 				error("ERROR");
 			}
 
-			enter_excess(thread_ctx.g, update.u);
+			enter_excess(thread_ctx->g, update.u);
 		}
-		thread_ctx.count = 0;
+		thread_ctx->count = 0;
 	}
 }
 
@@ -634,6 +627,7 @@ static void init_workers(preflow_context_t *algo)
 		// Hacky fixa snyggt sen
 		g_plq[i].barrier = &algo->barrier;
 		g_plq[i].tid = i;
+		g_plq[i].count = 0;
 
 		g_plq[i].all_thread_ctx = g_plq;
 		g_plq[i].all_thread_ctx_size = algo->threadcount;
@@ -765,8 +759,8 @@ static void setup(preflow_context_t *algo_ctx)
 {
 	graph_t *g = algo_ctx->g;
 
-	init_preflow(g);
 	init_mutexes(g);
+	init_preflow(g);
 	pthread_barrier_init(&algo_ctx->barrier, NULL, algo_ctx->threadcount);
 	init_workers(algo_ctx);
 }
