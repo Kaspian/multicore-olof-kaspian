@@ -174,40 +174,15 @@ static void *xcalloc(size_t n, size_t s)
 	return p;
 }
 
-static char buf[1 << 22]; // 4 MB buffer instead of 1 MB
-static int idx = 0, size = 0;
-
-static inline int fast_getchar()
-{
-	if (idx >= size)
-	{
-		size = fread(buf, 1, sizeof(buf), stdin);
-		idx = 0;
-		if (size == 0)
-			return EOF;
-	}
-	return buf[idx++];
-}
-
-static inline int isdigit_fast(int c)
-{
-	return (c >= '0' && c <= '9');
-}
-
 static int next_int()
 {
-	int x = 0, c;
-	// skip non-digits
-	while ((c = fast_getchar()) != EOF && !isdigit_fast(c))
-		;
-	if (c == EOF)
-		return 0;
-	// parse digits
-	do
-	{
-		x = 10 * x + (c - '0');
-		c = fast_getchar();
-	} while (c != EOF && isdigit_fast(c));
+	int x;
+	int c;
+
+	x = 0;
+	while (isdigit(c = getchar()))
+		x = 10 * x + c - '0';
+
 	return x;
 }
 
