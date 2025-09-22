@@ -16,6 +16,7 @@
 
 #define PRINT 0 /* enable/disable prints. */
 #define MIN(a, b) (((a) <= (b)) ? (a) : (b))
+#define MAX(a, b) (((a) >= (b)) ? (a) : (b))
 
 typedef int bool_t;
 
@@ -51,18 +52,15 @@ static char *progname;
 /*  Algorithm Structs           */
 /* ---------------------------- */
 
-struct list_t
-{
-	edge_t *edge;
-	list_t *next;
-};
-
 struct node_t
 {
 	int h;		  /* height.			*/
 	int e;		  /* excess flow.			*/
-	list_t *edge; /* adjacency list.		*/
 	node_t *next; /* with excess preflow.		*/
+
+	int cur;		// current-arc index into edges[]
+	edge_t **edges; // adjacency array
+	int degree;
 
 	int is_in_queue; /* flag to keep track of whether already in the excess queue */ // TODO: Atomic?
 	pthread_mutex_t n_lock;															 /* individual lock for each node */
@@ -176,36 +174,41 @@ static void *xcalloc(size_t n, size_t s)
 	return p;
 }
 
+static char buf[1 << 22]; // 4 MB buffer instead of 1 MB
+static int idx = 0, size = 0;
+
+static inline int fast_getchar()
+{
+	if (idx >= size)
+	{
+		size = fread(buf, 1, sizeof(buf), stdin);
+		idx = 0;
+		if (size == 0)
+			return EOF;
+	}
+	return buf[idx++];
+}
+
+static inline int isdigit_fast(int c)
+{
+	return (c >= '0' && c <= '9');
+}
+
 static int next_int()
 {
-	int x;
-	int c;
-
-	x = 0;
-	while (isdigit(c = getchar()))
-		x = 10 * x + c - '0';
-
+	int x = 0, c;
+	// skip non-digits
+	while ((c = fast_getchar()) != EOF && !isdigit_fast(c))
+		;
+	if (c == EOF)
+		return 0;
+	// parse digits
+	do
+	{
+		x = 10 * x + (c - '0');
+		c = fast_getchar();
+	} while (c != EOF && isdigit_fast(c));
 	return x;
-}
-
-static void add_edge(node_t *u, edge_t *e)
-{
-	list_t *p;
-
-	p = xmalloc(sizeof(list_t));
-	p->edge = e;
-	p->next = u->edge;
-	u->edge = p;
-}
-
-static void connect(node_t *u, node_t *v, int c, edge_t *e)
-{
-	e->u = u;
-	e->v = v;
-	e->c = c;
-
-	add_edge(u, e);
-	add_edge(v, e);
 }
 
 static node_t *other(node_t *u, edge_t *e)
@@ -372,25 +375,14 @@ static void push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 static int _find_min_residual_cap(graph_t *g, node_t *u)
 {
 	int min_h = INT_MAX;
-	list_t *p;
-	edge_t *e;
-	node_t *v;
-
-	for (p = u->edge; p != NULL; p = p->next)
+	for (int i = 0; i < u->degree; i++)
 	{
-		e = p->edge;
-
-		v = other(u, e);
-		int rf;
-		if (u == e->u)
-			rf = e->c - e->f; // residual capacity from u -> v
-		else
-			rf = e->c + e->f; // residual capacity from u <- v
-
+		edge_t *e = u->edges[i];
+		node_t *v = (u == e->u) ? e->v : e->u;
+		int rf = (u == e->u) ? (e->c - e->f) : (e->c + e->f);
 		if (rf > 0)
 			min_h = MIN(min_h, v->h);
 	}
-
 	return min_h;
 }
 
@@ -430,40 +422,36 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 	node_t *v;
 	int b;
 
-	for (p = u->edge; p != NULL; p = p->next)
+	for (int i = u->cur; i < u->degree; i++)
 	{
-		e = p->edge;
+		edge_t *e = u->edges[i];
+		node_t *v = (u == e->u) ? e->v : e->u;
+		int b = (u == e->u) ? 1 : -1;
 
-		bool_t is_forward = (u == e->u);
-		v = is_forward ? e->v : e->u;
-		b = is_forward ? 1 : -1;
-
-		// if (u == e->u)
-		// {
-		// 	v = e->v;
-		// 	b = 1;
-		// }
-		// else
-		// {
-		// 	v = e->u;
-		// 	b = -1;
-		// }
-
-		can_push = (u->h > v->h) && (b * e->f < e->c);
+		bool_t can_push = (u->h > v->h) && (b * e->f < e->c);
 
 		if (can_push)
 		{
 			push(ctx, u, v, e);
 			pushed = 1;
+
+			if (u->e == 0)
+			{
+				u->cur = i; // resume from here next time
+				return;
+			}
 		}
 	}
 
 	if (!pushed)
 	{
 		relabel(ctx, u);
+		u->cur = 0;
 	}
 	else if (u->e > 0)
 	{
+		u->cur = 0;
+
 		size_t index = ctx->count;
 
 		update_t update;
@@ -501,6 +489,9 @@ static void _apply_updates(thread_ctx_t *ctx)
 	thread_ctx_t *all_thread_contexts = ctx->all_thread_ctx;
 	size_t all_thread_contexts_size = ctx->all_thread_ctx_size;
 
+	// Acquire the global graph lock once for all updates
+	pthread_mutex_lock(&ctx->g->g_lock);
+
 	for (i = 0; i < all_thread_contexts_size; i++)
 	{
 		thread_ctx_t *thread_ctx = &all_thread_contexts[i];
@@ -517,16 +508,20 @@ static void _apply_updates(thread_ctx_t *ctx)
 			else if (update.type == 1)
 			{
 				update.u->h = update.new_height;
+				update.u->cur = 0; // reset current arc after relabel
 			}
 			else
 			{
 				error("ERROR");
 			}
 
-			enter_excess(ctx->g, update.u);
+			enter_excess_locked(ctx->g, update.u);
 		}
 		thread_ctx->count = 0;
 	}
+
+	// Release the global graph lock after all updates
+	pthread_mutex_unlock(&ctx->g->g_lock);
 }
 
 void *worker(void *arg)
@@ -558,45 +553,41 @@ void *worker(void *arg)
 			break;
 		}
 
+		bool_t local_work = 0;
+
 		while (tctx->inqueue_index < tctx->inqueue_count)
 		{
 			node_t *u = tctx->inqueue[tctx->inqueue_index++];
 			if (u)
 			{
-				tctx->did_work = 1;
+				local_work = 1;
 				_build_update_queue(tctx, u);
 			}
-			else
-			{
-				tctx->did_work = 0;
-			}
 		}
+		tctx->did_work = local_work;
 
-		pthread_barrier_wait(tctx->barrier);
-
-		if (tctx->tid == 0) // Special Thread 0
+		int res = pthread_barrier_wait(tctx->barrier);
+		if (res == PTHREAD_BARRIER_SERIAL_THREAD)
 		{
 			bool_t algo_done = 1;
 			for (int i = 0; i < tctx->all_thread_ctx_size; i++)
 			{
-				// pr("Thread %d, Is On Status: %d\n", tctx->all_thread_ctx[i].tid, tctx->all_thread_ctx[i].did_work);
 				if (tctx->all_thread_ctx[i].did_work != 0)
 				{
 					algo_done = 0;
+					break;
 				}
 			}
-			if (algo_done)
+			if (algo_done && g->excess == NULL)
 			{
-				// pr("We get there");
 				g->done = 1;
-				// pr("We are chainging this.");
 			}
 			else
 			{
 				_apply_updates(tctx);
 			}
 		}
-
+		// second sync so all threads see updated g->done
 		pthread_barrier_wait(tctx->barrier);
 	}
 	return NULL;
@@ -607,7 +598,7 @@ static void init_workers(preflow_context_t *algo)
 	graph_t *g = algo->g;
 	pthread_t *threads = algo->threads;
 	int threadcount = algo->threadcount;
-	int inqueue_batch_size = 32;
+	int inqueue_batch_size = MAX(g->n / 8, 1);
 
 	thread_ctx_t *g_plq = (thread_ctx_t *)xcalloc(threadcount, sizeof(thread_ctx_t));
 	algo->thread_ctxs = g_plq; // <== add this
@@ -618,7 +609,7 @@ static void init_workers(preflow_context_t *algo)
 	{
 		// TODO: Memory Bug?
 		// TODO: Way too much memory allocated.
-		update_t *thread_out_q = (update_t *)xcalloc(g->n, sizeof(update_t));
+		update_t *thread_out_q = (update_t *)xcalloc(g->m, sizeof(update_t));
 		g_plq[i].g = g;
 		g_plq[i].plq = thread_out_q;
 		// Hacky fixa snyggt sen
@@ -667,36 +658,56 @@ void destroy_mutexes(graph_t *g)
 
 static graph_t *new_graph(FILE *in, int n, int m)
 {
-	graph_t *g;
-	node_t *u;
-	node_t *v;
-	int i;
-	int a;
-	int b;
-	int c;
-
-	g = xmalloc(sizeof(graph_t));
-
+	graph_t *g = xmalloc(sizeof(graph_t));
 	g->n = n;
 	g->m = m;
-
 	g->v = xcalloc(n, sizeof(node_t));
 	g->e = xcalloc(m, sizeof(edge_t));
-
 	g->s = &g->v[0];
 	g->t = &g->v[n - 1];
 	g->excess = NULL;
 
-	for (i = 0; i < m; i += 1)
-	{
-		a = next_int();
-		b = next_int();
-		c = next_int();
-		u = &g->v[a];
+	// read edges and count degrees
+	int *deg = xcalloc(n, sizeof(int));
+	int *a = xmalloc(m * sizeof(int));
+	int *b = xmalloc(m * sizeof(int));
+	int *c = xmalloc(m * sizeof(int));
 
-		v = &g->v[b];
-		connect(u, v, c, g->e + i);
+	for (int i = 0; i < m; i++)
+	{
+		a[i] = next_int();
+		b[i] = next_int();
+		c[i] = next_int();
+		deg[a[i]]++;
+		deg[b[i]]++;
 	}
+
+	// allocate adjacency arrays
+	for (int i = 0; i < n; i++)
+	{
+		g->v[i].edges = xcalloc(deg[i], sizeof(edge_t *));
+		g->v[i].degree = deg[i];
+		g->v[i].cur = 0;
+		deg[i] = 0; // reset for filling
+	}
+
+	// create edge structs and hook into arrays
+	for (int i = 0; i < m; i++)
+	{
+		edge_t *e = &g->e[i];
+		e->u = &g->v[a[i]];
+		e->v = &g->v[b[i]];
+		e->c = c[i];
+		e->f = 0;
+
+		g->v[a[i]].edges[deg[a[i]]++] = e;
+		g->v[b[i]].edges[deg[b[i]]++] = e;
+	}
+
+	free(deg);
+	free(a);
+	free(b);
+	free(c);
 
 	return g;
 }
@@ -714,19 +725,9 @@ static void free_ctx(preflow_context_t *algo)
 
 static void free_graph(graph_t *g)
 {
-	int i;
-	list_t *p;
-	list_t *q;
-
-	for (i = 0; i < g->n; i += 1)
+	for (int i = 0; i < g->n; i++)
 	{
-		p = g->v[i].edge;
-		while (p != NULL)
-		{
-			q = p->next;
-			free(p);
-			p = q;
-		}
+		free(g->v[i].edges);
 	}
 	free(g->v);
 	free(g->e);
@@ -735,21 +736,31 @@ static void free_graph(graph_t *g)
 
 static void init_preflow(graph_t *g)
 {
-	list_t *p;
-	edge_t *e;
 	node_t *s = g->s;
 
 	s->h = g->n;
 	s->e = 0;
 
-	for (p = s->edge; p != NULL; p = p->next)
+	// First compute source excess = sum of outgoing capacities
+	for (int i = 0; i < s->degree; i++)
 	{
-		e = p->edge;
-		s->e += e->c;
+		edge_t *e = s->edges[i];
+		if (s == e->u)
+		{
+			s->e += e->c;
+		}
+		else
+		{
+			s->e += e->c;
+		}
 	}
 
-	for (p = s->edge; p != NULL; p = p->next)
-		init_push(g, s, other(s, p->edge), p->edge);
+	// Then push that flow to all neighbors
+	for (int i = 0; i < s->degree; i++)
+	{
+		edge_t *e = s->edges[i];
+		init_push(g, s, other(s, e), e);
+	}
 }
 
 static void setup(preflow_context_t *algo_ctx)
@@ -795,7 +806,7 @@ int main(int argc, char *argv[])
 	int m;					/* number of edges.		*/
 	preflow_context_t algo; /* algorithm context - struct wrapper for algorithm setup and attributes */
 
-	tc = get_opt_thread_count();
+	tc = 8;
 	pthread_t threads[tc]; /* array of threads */
 	pthread_barrier_t barrier;
 
