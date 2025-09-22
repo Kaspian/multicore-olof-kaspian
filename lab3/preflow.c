@@ -47,8 +47,6 @@ static char *progname;
 #define pr(...) /* no effect at all */
 #endif
 
-
-
 /* ---------------------------- */
 /*  Algorithm Structs           */
 /* ---------------------------- */
@@ -129,6 +127,11 @@ struct thread_ctx_t
 
 	thread_ctx_t *all_thread_ctx;
 	size_t all_thread_ctx_size;
+
+	node_t **inqueue;
+	int inqueue_size;  // capacity of inqueue array
+	int inqueue_count; // number of valid nodes in inqueue
+	int inqueue_index; // next index to pop
 
 	bool_t did_work;
 	pthread_barrier_t *barrier;
@@ -406,9 +409,9 @@ static void relabel(thread_ctx_t *ctx, node_t *u)
 	int h = _relabel(min_h, u);
 
 	update_t update;
-	update.type = 1;              // 1 == RELABEL
+	update.type = 1; // 1 == RELABEL
 	update.u = u;
-	update.delta = 0;             // delta not needed for relabel?
+	update.delta = 0; // delta not needed for relabel?
 	update.new_height = h;
 
 	ctx->plq[ctx->count++] = update;
@@ -534,20 +537,39 @@ void *worker(void *arg)
 	node_t *u = NULL;
 	while (1)
 	{
+		tctx->inqueue_count = 0;
+		tctx->inqueue_index = 0;
+
+		pthread_mutex_lock(&g->g_lock);
+		for (int i = 0; i < tctx->inqueue_size; i++)
+		{
+			node_t *n = leave_excess_locked(g);
+			if (!n)
+				break;
+			tctx->inqueue[tctx->inqueue_count++] = n;
+		}
+		pthread_mutex_unlock(&g->g_lock);
+
 		bool_t done = g->done;
 
-		if(done == 1) {
+		if (done == 1)
+		{
 			pr("The loop finishes.");
 			break;
 		}
 
-		u = leave_excess(g);
-
-		if (u){
-			tctx->did_work = 1;
-			_build_update_queue(tctx, u);
-		} else {
-			tctx->did_work = 0;
+		while (tctx->inqueue_index < tctx->inqueue_count)
+		{
+			node_t *u = tctx->inqueue[tctx->inqueue_index++];
+			if (u)
+			{
+				tctx->did_work = 1;
+				_build_update_queue(tctx, u);
+			}
+			else
+			{
+				tctx->did_work = 0;
+			}
 		}
 
 		pthread_barrier_wait(tctx->barrier);
@@ -555,23 +577,29 @@ void *worker(void *arg)
 		if (tctx->tid == 0) // Special Thread 0
 		{
 			bool_t algo_done = 1;
-			for(int i = 0; i < tctx->all_thread_ctx_size; i++) {
-				//pr("Thread %d, Is On Status: %d\n", tctx->all_thread_ctx[i].tid, tctx->all_thread_ctx[i].did_work);
-				if(tctx->all_thread_ctx[i].did_work != 0) {
+			for (int i = 0; i < tctx->all_thread_ctx_size; i++)
+			{
+				// pr("Thread %d, Is On Status: %d\n", tctx->all_thread_ctx[i].tid, tctx->all_thread_ctx[i].did_work);
+				if (tctx->all_thread_ctx[i].did_work != 0)
+				{
 					algo_done = 0;
 				}
 			}
-			if(algo_done) {
-				//pr("We get there");
+			if (algo_done)
+			{
+				// pr("We get there");
 				g->done = 1;
-				//pr("We are chainging this.");
-			} else {
+				// pr("We are chainging this.");
+			}
+			else
+			{
 				_apply_updates(tctx);
 			}
 		}
 
 		pthread_barrier_wait(tctx->barrier);
 	}
+	return NULL;
 }
 
 static void init_workers(preflow_context_t *algo)
@@ -579,6 +607,7 @@ static void init_workers(preflow_context_t *algo)
 	graph_t *g = algo->g;
 	pthread_t *threads = algo->threads;
 	int threadcount = algo->threadcount;
+	int inqueue_batch_size = 32;
 
 	thread_ctx_t *g_plq = (thread_ctx_t *)xcalloc(threadcount, sizeof(thread_ctx_t));
 	algo->thread_ctxs = g_plq; // <== add this
@@ -599,6 +628,12 @@ static void init_workers(preflow_context_t *algo)
 
 		g_plq[i].all_thread_ctx = g_plq;
 		g_plq[i].all_thread_ctx_size = algo->threadcount;
+
+		// Allocate local inqueue
+		g_plq[i].inqueue_size = inqueue_batch_size;
+		g_plq[i].inqueue = (node_t **)xcalloc(inqueue_batch_size, sizeof(node_t *));
+		g_plq[i].inqueue_count = 0;
+		g_plq[i].inqueue_index = 0;
 
 		if (pthread_create(&threads[i], NULL, worker, &g_plq[i]) != 0)
 		{
@@ -670,10 +705,11 @@ static void free_ctx(preflow_context_t *algo)
 {
 	for (int i = 0; i < algo->threadcount; i += 1)
 	{
-		free(algo->thread_ctxs[i].plq);  // Free per-thread update queue
+		free(algo->thread_ctxs[i].plq);		// Free per-thread update queue
+		free(algo->thread_ctxs[i].inqueue); // Free per-thread inqueue
 	}
 
-	free(algo->thread_ctxs);  // Free thread_ctx array itself
+	free(algo->thread_ctxs); // Free thread_ctx array itself
 }
 
 static void free_graph(graph_t *g)
@@ -730,7 +766,7 @@ static void teardown(preflow_context_t *algo_ctx)
 {
 	graph_t *g = algo_ctx->g;
 
-	free_ctx(algo_ctx);  // Now safe to free thread contexts
+	free_ctx(algo_ctx); // Now safe to free thread contexts
 	pthread_barrier_destroy(algo_ctx->barrier);
 	destroy_mutexes(algo_ctx->g);
 }
