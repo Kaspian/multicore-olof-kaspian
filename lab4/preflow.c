@@ -299,15 +299,16 @@ static void init_push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 /*  Preflow Algorithm Helpers   */
 /* ---------------------------- */
 
-static int push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
+static int push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e, uint8_t dir)
 {
   if (u->h != v->h + 1)  // enforce valid push
         return 0;
 
   uint32_t u_excess = atomic_load(&u->e);
   uint32_t f 		 = atomic_load(&e->f);
-  uint32_t d = (u == e->u) ? MIN(u_excess, e->c - f)
-                      : MIN(u_excess, e->c + f);
+  uint32_t d = MIN(u_excess, e->c - (dir * f));
+  //uint32_t d = (u == e->u) ? MIN(u_excess, e->c - f)
+                      //: MIN(u_excess, e->c + f);
 
   if (u == e->u) atomic_fetch_add(&e->f, d);
   else           atomic_fetch_sub(&e->f, d);
@@ -342,7 +343,8 @@ static uint8_t _find_min_residual_cap(graph_t *g, node_t *u)
     v = a->neighbor;
     //e = u->edges[i];
     f = atomic_load(&e->f);
-    residual  = (a->dir == 0) ? (e->c - f) : (e->c + f);
+    residual  = e->c - (a->dir * f);
+    //residual  = (a->dir == 0) ? (e->c - f) : (e->c + f);
     //residual  = (u == e->u) ? e->c - f : e->c + f;
     //v         = (u == e->u) ? e->v : e->u;
 
@@ -388,7 +390,7 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
     e = a->e;
     v = a->neighbor;
 		//v = (u == e->u) ? e->v : e->u;
-		d = push(ctx, u, v, e);
+		d = push(ctx, u, v, e, a->dir);
 
 		if(d > 0)
 		{
@@ -613,12 +615,12 @@ static graph_t *new_graph(FILE *in, int n, int m)
 
 		g->v[a[i]].edges[deg[a[i]]].e = e;
 		g->v[a[i]].edges[deg[a[i]]].neighbor = &g->v[b[i]];
-		g->v[a[i]].edges[deg[a[i]]].dir = 0;
+		g->v[a[i]].edges[deg[a[i]]].dir = 1;
     deg[a[i]]++;
 
 		g->v[b[i]].edges[deg[b[i]]].e = e;
 		g->v[b[i]].edges[deg[b[i]]].neighbor = &g->v[a[i]];
-		g->v[b[i]].edges[deg[b[i]]].dir = 1;
+		g->v[b[i]].edges[deg[b[i]]].dir = -1;
     deg[b[i]]++;
 	}
 
