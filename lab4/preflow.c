@@ -29,15 +29,16 @@ Phase 2 then only has to handle relabels. Makes sequential part of the program m
 #define MAX_NODE_HEIGHT 255 /* Used for determining sizes of the integers, TODO: Make dynamic */
 
 /* This is best on my Home Pc (Ryzen 6 core, 12 logical CPU's) */
-/*
 #define TC 12
-#define NODES_PER_BATCH 8
-*/
-
-/* My Laptop (Ryzen 7 7730U, 8 core, 16 logical CPU's) */ 
-#define TC 16
-#define NODES_PER_BATCH 8
+#define NODES_PER_BATCH 10
 #define CACHE_PADDING CACHE_ALIGN_X86 
+
+/* My Laptop (Ryzen 7 7730U, 8 core, 16 logical CPU's) */
+/*
+#define TC 16
+#define NODES_PER_BATCH 16
+#define CACHE_PADDING CACHE_ALIGN_X86 
+*/
 
 /* Possible POWER8 Configs - Test
 #define CACHE_ALIGN_PADDING CACHE_ALIGN_POWER8
@@ -53,10 +54,12 @@ OR
 #define MIN(a, b) (((a) <= (b)) ? (a) : (b))
 #define MAX(a, b) (((a) >= (b)) ? (a) : (b))
 #define BATCH_SIZE(N, THREADCOUNT)  ((N / (THREADCOUNT * NODES_PER_BATCH)) > 1 ? (N / (THREADCOUNT * NODES_PER_BATCH)) : 1)
+#define BUFSIZE (1<<16)
 
 typedef struct graph_t graph_t;
 typedef struct node_t node_t;
 typedef struct edge_t edge_t;
+typedef struct adj_t adj_t;
 typedef struct list_t list_t;
 typedef struct preflow_context_t preflow_context_t;
 typedef struct thread_ctx_t thread_ctx_t;
@@ -88,12 +91,20 @@ static char *progname;
 /*  Algorithm Structs           */
 /* ---------------------------- */
 
-struct node_t {
+struct adj_t
+{
+  edge_t *e;
+  node_t *neighbor;
+  uint8_t dir;
+};
+
+struct node_t
+{
     uint8_t h, cur, degree;
     bool is_in_queue;
     atomic_int e;
     node_t *next;
-    edge_t **edges;
+    adj_t *edges;
 } __attribute__((aligned(CACHE_PADDING))); // or 128 for POWER8
 
 struct edge_t
@@ -204,16 +215,36 @@ static void *xcalloc(size_t n, size_t s)
 	return p;
 }
 
-static int next_int()
+/* Quickly optimizing next_int as well */
+static char buf[BUFSIZE];
+static int idx = 0, size = 0;
+
+static char read_char()
 {
-	int x;
-	int c;
+  if (idx >= size) {
+      size = fread(buf, 1, BUFSIZE, stdin);
+      idx = 0;
+      if (size == 0) return EOF;
+  }
+  return buf[idx++];
+}
 
-	x = 0;
-	while (isdigit(c = getchar()))
-		x = 10 * x + c - '0';
+static uint32_t next_int()
+{
+	uint32_t x = 0;
+  char c = 0;
 
-	return x;
+  do {
+    c = read_char();
+    if (c == EOF) return EOF;
+  } while (c < '0' || c > '9');
+
+  do {
+    x = x * 10 + (c - '0');
+    c = read_char();
+  } while (c >= '0' && c <= '9');
+
+  return x;
 }
 
 static node_t *other(node_t *u, edge_t *e)
@@ -298,55 +329,65 @@ static int push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 static uint8_t _find_min_residual_cap(graph_t *g, node_t *u)
 {
   uint8_t i, f, residual, min_h;
+  adj_t  *a;
   edge_t *e;
   node_t *v;
 	
   min_h = UINT8_MAX;
 	for (i = 0; i < u->degree; i++)
 	{
-		e = u->edges[i];
-    	f = atomic_load(&e->f);
-		residual  = (u == e->u) ? e->c - f : e->c + f;
-		v         = (u == e->u) ? e->v : e->u;
-		
-		if (residual > 0)
-			min_h = MIN(min_h, v->h);
-	}
-	return min_h;
+    a = &u->edges[i];
+    // a = &u->edges[i];
+    e = a->e;
+    v = a->neighbor;
+    //e = u->edges[i];
+    f = atomic_load(&e->f);
+    residual  = (a->dir == 0) ? (e->c - f) : (e->c + f);
+    //residual  = (u == e->u) ? e->c - f : e->c + f;
+    //v         = (u == e->u) ? e->v : e->u;
+
+    if (residual > 0)
+      min_h = MIN(min_h, v->h);
+  }
+  return min_h;
 }
 
 static uint8_t _relabel(int min_h, node_t *u)
 {
-	if (min_h < UINT8_MAX)
-		return min_h + 1;
-	else
-		return u->h + 1;
+  if (min_h < UINT8_MAX)
+    return min_h + 1;
+  else
+    return u->h + 1;
 }
 
 static void relabel(thread_ctx_t *ctx, node_t *u)
 {
-    uint8_t min_h = _find_min_residual_cap(ctx->g, u);
-    uint8_t new_h = _relabel(min_h, u);
+  uint8_t min_h = _find_min_residual_cap(ctx->g, u);
+  uint8_t new_h = _relabel(min_h, u);
 
-    // Initialize update struct in one go
-    update_t update = { .type = RELABEL, .u = u, .delta = 0, .new_height = new_h, .g = ctx->g };
-    ctx->plq[ctx->count++] = update;
+  // Initialize update struct in one go
+  update_t update = { .type = RELABEL, .u = u, .delta = 0, .new_height = new_h, .g = ctx->g };
+  ctx->plq[ctx->count++] = update;
 }
 
 static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 {
-	uint8_t i, degree;
-  	uint32_t d, excess;
-	edge_t* e;
-	node_t* v;
-  	bool pushed = false;
+  uint8_t  i, degree;
+  uint32_t d, excess;
+  adj_t*  a;
+  edge_t* e;
+  node_t* v;
+  bool pushed = false;
 
-	i      = u->cur;
-	degree = u->degree;
-	while(i < degree)
-	{
-		e = u->edges[i];
-		v = (u == e->u) ? e->v : e->u;
+  i      = u->cur;
+  degree = u->degree;
+  while(i < degree)
+  {
+    a = &u->edges[i];
+    // a = &u->edges[i];
+    e = a->e;
+    v = a->neighbor;
+		//v = (u == e->u) ? e->v : e->u;
 		d = push(ctx, u, v, e);
 
 		if(d > 0)
@@ -554,7 +595,7 @@ static graph_t *new_graph(FILE *in, int n, int m)
 	// allocate adjacency arrays
 	for (int i = 0; i < n; i++)
 	{
-		g->v[i].edges = xcalloc(deg[i], sizeof(edge_t *));
+		g->v[i].edges = xcalloc(deg[i], sizeof(adj_t));
 		g->v[i].degree = deg[i];
 		g->v[i].cur = 0;
 		deg[i] = 0; // reset for filling
@@ -570,8 +611,15 @@ static graph_t *new_graph(FILE *in, int n, int m)
 		e->c = c[i];
 		atomic_init(&e->f, 0);
 
-		g->v[a[i]].edges[deg[a[i]]++] = e;
-		g->v[b[i]].edges[deg[b[i]]++] = e;
+		g->v[a[i]].edges[deg[a[i]]].e = e;
+		g->v[a[i]].edges[deg[a[i]]].neighbor = &g->v[b[i]];
+		g->v[a[i]].edges[deg[a[i]]].dir = 0;
+    deg[a[i]]++;
+
+		g->v[b[i]].edges[deg[b[i]]].e = e;
+		g->v[b[i]].edges[deg[b[i]]].neighbor = &g->v[a[i]];
+		g->v[b[i]].edges[deg[b[i]]].dir = 1;
+    deg[b[i]]++;
 	}
 
 	free(deg);
@@ -614,13 +662,17 @@ static void init_preflow(graph_t *g)
 
 	for (int i = 0; i < s->degree; i++)
 	{
-		edge_t *e = s->edges[i];
+    adj_t  *a = &s->edges[i];
+    edge_t *e = a->e;
+		//edge_t *e = s->edges[i];
 		atomic_fetch_add(&s->e, e->c);
 	}
 
 	for (int i = 0; i < s->degree; i++)
 	{
-		edge_t *e = s->edges[i];
+    adj_t  *a = &s->edges[i];
+    edge_t *e = a->e;
+		//edge_t *e = s->edges[i];
 		init_push(g, s, other(s, e), e);
 	}
 }
