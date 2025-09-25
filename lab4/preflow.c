@@ -30,7 +30,7 @@ Phase 2 then only has to handle relabels. Makes sequential part of the program m
 
 /* This is best on my Home Pc (Ryzen 6 core, 12 logical CPU's) */
 #define TC 12
-#define NODES_PER_BATCH 10
+#define NODES_PER_BATCH 8
 #define CACHE_PADDING CACHE_ALIGN_X86 
 
 /* My Laptop (Ryzen 7 7730U, 8 core, 16 logical CPU's) */
@@ -50,6 +50,7 @@ OR
 -- Continue Tweaking these
 */
 
+#define DIAGNOSTICS 0
 #define PRINT 0 /* enable/disable prints. */
 #define MIN(a, b) (((a) <= (b)) ? (a) : (b))
 #define MAX(a, b) (((a) >= (b)) ? (a) : (b))
@@ -87,6 +88,16 @@ static char *progname;
 #define pr(...) /* no effect at all */
 #endif
 
+#if DIAGNOSTICS
+#define pr_diag(...)                       \
+	do                                \
+	{                                 \
+		fprintf(stderr, __VA_ARGS__); \
+	} while (0)
+#else
+#define pr_diag(...) /* no effect at all */
+#endif
+
 /* ---------------------------- */
 /*  Algorithm Structs           */
 /* ---------------------------- */
@@ -95,11 +106,12 @@ struct adj_t
 {
   edge_t *e;
   node_t *neighbor;
-  uint8_t dir;
+  int8_t dir;
 };
 
 struct node_t
 {
+	uint32_t id;
     uint8_t h, cur, degree;
     bool is_in_queue;
     atomic_int e;
@@ -174,6 +186,12 @@ struct thread_ctx_t
 
 	bool did_work;
 	pthread_barrier_t *barrier;
+	uint8_t *owned;
+	
+	#ifdef DIAGNOSTICS
+	uint64_t owned_pushes;
+	uint64_t atomic_pushes;
+	#endif
 } __attribute__((aligned(CACHE_PADDING)));
 
 /* ---------------------------- */
@@ -299,32 +317,61 @@ static void init_push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 /*  Preflow Algorithm Helpers   */
 /* ---------------------------- */
 
-static int push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e, uint8_t dir)
+static int push_owned(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e, int8_t dir)
+{
+	if (u->h != v->h + 1)  // enforce valid push
+		return 0;
+
+	uint32_t u_excess = u->e;
+	uint32_t f 	      = e->f;
+	uint32_t d1 = MIN(u_excess, e->c - f);
+	uint32_t d2 = MIN(u_excess, e->c + f);
+	uint32_t d = (dir == 1) ? d1 : d2;
+
+	if (dir == 1) e->f += d;
+	else 		  e->f -= d;
+
+	u->e -= d;
+	v->e += d;
+
+	  #ifdef PRINT
+	if(d != 0) {
+		pr("push from %d to %d: ", id(g, u), id(g, v));
+		pr("f = %d, c = %d, so ", atomic_load(&e->f), e->c);
+		pr("pushing %d\n", d);
+	}
+  #endif
+
+  return d;
+}
+
+static int push_atomic(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e, int8_t dir)
 {
   if (u->h != v->h + 1)  // enforce valid push
         return 0;
 
   uint32_t u_excess = atomic_load(&u->e);
-  uint32_t f 		 = atomic_load(&e->f);
-  uint32_t d = MIN(u_excess, e->c - (dir * f));
-  //uint32_t d = (u == e->u) ? MIN(u_excess, e->c - f)
+  uint32_t f 		    = atomic_load(&e->f);
                       //: MIN(u_excess, e->c + f);
+  uint32_t d1 = MIN(u_excess, e->c - f);
+  uint32_t d2 = MIN(u_excess, e->c + f);
+  uint32_t d  = (dir == 1) ? d1 : d2;
 
-  if (u == e->u) atomic_fetch_add(&e->f, d);
-  else           atomic_fetch_sub(&e->f, d);
+  if (dir == 1) atomic_fetch_add(&e->f, d);
+  else          atomic_fetch_sub(&e->f, d);
 
   atomic_fetch_sub(&u->e, d);
   atomic_fetch_add(&v->e, d);
 
   #ifdef PRINT
-	if(push != 0) {
+	if(d != 0) {
 		pr("push from %d to %d: ", id(g, u), id(g, v));
 		pr("f = %d, c = %d, so ", atomic_load(&e->f), e->c);
-		pr("pushing %d\n", push);
+		pr("pushing %d\n", d);
 	}
   #endif
 
-	return d;
+  return d;
 }
 
 static uint8_t _find_min_residual_cap(graph_t *g, node_t *u)
@@ -342,7 +389,8 @@ static uint8_t _find_min_residual_cap(graph_t *g, node_t *u)
     e = a->e;
     v = a->neighbor;
     //e = u->edges[i];
-    f = atomic_load(&e->f);
+    f = atomic_load_explicit(&e->f, memory_order_relaxed);
+    //f = atomic_load(&e->f);
     residual  = e->c - (a->dir * f);
     //residual  = (a->dir == 0) ? (e->c - f) : (e->c + f);
     //residual  = (u == e->u) ? e->c - f : e->c + f;
@@ -389,20 +437,32 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
     // a = &u->edges[i];
     e = a->e;
     v = a->neighbor;
-		//v = (u == e->u) ? e->v : e->u;
-		d = push(ctx, u, v, e, a->dir);
 
-		if(d > 0)
-		{
-			pushed = true;
-			ctx->plq[ctx->count++] = (update_t){ .type=PUSH, .u=v, .delta=d, .g=ctx->g };
-		}
-		if(atomic_load(&u->e) == 0)
-		{
-			u->cur = i;
-      return;
-		}
-		++i;
+	if(ctx->owned[v->id]) {
+		d = push_owned(ctx, u, v, e, a->dir);
+		#ifdef DIAGNOSTICS
+		ctx->owned_pushes++;
+		#endif
+	}
+	else
+	{
+		d = push_atomic(ctx, u, v, e, a->dir);
+		#ifdef DIAGNOSTICS
+		ctx->atomic_pushes++;
+		#endif
+	}
+	if(d > 0)
+	{
+		pushed = true;
+		ctx->plq[ctx->count++] = (update_t){ .type=PUSH, .u=v, .delta=d, .g=ctx->g };
+	}
+	if(atomic_load(&u->e) == 0)
+	{
+		u->cur = i;
+		return;
+	}
+	
+	++i;
 	}
 
   if(!pushed)
@@ -443,7 +503,7 @@ static void _apply_updates(thread_ctx_t *ctx)
 	}
 }
 
-static uint8_t grab_excess_batch(graph_t *g, node_t **local_queue, uint32_t max_nodes) {
+static uint8_t grab_excess_batch(graph_t *g, node_t **local_queue, uint32_t max_nodes, uint8_t *owned) {
 	uint8_t count = 0;
 	node_t *v;
 
@@ -457,6 +517,9 @@ static uint8_t grab_excess_batch(graph_t *g, node_t **local_queue, uint32_t max_
 
         local_queue[count++] = v;
         g->work_counter--;
+    }
+    for (int i = 0; i < count; ++i) {
+        owned[local_queue[i]->id] = 1;
     }
     pthread_mutex_unlock(&g->g_lock);
 
@@ -475,7 +538,7 @@ void *worker(void *arg)
 
     while (1)
     {
-        n = grab_excess_batch(g, local_queue, tctx->inqueue_size);
+        n = grab_excess_batch(g, local_queue, tctx->inqueue_size, tctx->owned);
         if (n == 0)
 		{
             // nothing to do this round, wait at barrier
@@ -503,6 +566,10 @@ void *worker(void *arg)
                 local_work = true;
                 _build_update_queue(tctx, u);
             }
+        }
+
+		for (i = 0; i < n; ++i) {
+            tctx->owned[ local_queue[i]->id ] = 0;
         }
 
         tctx->did_work = local_work;
@@ -556,6 +623,8 @@ static void init_workers(preflow_context_t *algo)
 		g_plq[i].inqueue_count = 0;
 		g_plq[i].inqueue_index = 0;
 
+		g_plq[i].owned = xcalloc(g->n, sizeof(uint8_t));
+
 		if (pthread_create(&threads[i], NULL, worker, &g_plq[i]) != 0)
 		{
 			error("pthread_create");
@@ -600,6 +669,7 @@ static graph_t *new_graph(FILE *in, int n, int m)
 		g->v[i].edges = xcalloc(deg[i], sizeof(adj_t));
 		g->v[i].degree = deg[i];
 		g->v[i].cur = 0;
+		g->v[i].id = i;
 		deg[i] = 0; // reset for filling
 		atomic_init(&g->v[i].e, 0);
 	}
@@ -639,6 +709,7 @@ static void free_ctx(preflow_context_t *algo)
 	{
 		free(algo->thread_ctxs[i].plq);		// Free per-thread update queue
 		free(algo->thread_ctxs[i].inqueue); // Free per-thread inqueue
+		free(algo->thread_ctxs[i].owned);
 	}
 	free(algo->thread_ctxs); // Free thread_ctx array itself
 }
@@ -698,6 +769,20 @@ static void teardown(preflow_context_t *algo_ctx)
 static void preflow(preflow_context_t *algo_ctx)
 {
 	setup(algo_ctx);
+
+	#ifdef DIAGNOSTICS
+	uint64_t total_owned = 0, total_atomic = 0;
+	for (int t = 0; t < algo_ctx->threadcount; t++) {
+		total_owned  += algo_ctx->thread_ctxs[t].owned_pushes;
+		total_atomic += algo_ctx->thread_ctxs[t].atomic_pushes;
+	}
+
+	pr_diag("Owned pushes:  %lu\n", total_owned);
+	pr_diag("Atomic pushes: %lu\n", total_atomic);
+	double ratio = (total_owned + total_atomic) ? 
+				(double) total_owned / (total_owned + total_atomic) : 0.0;
+	pr_diag("Owned push ratio: %.2f%%\n", ratio * 100.0);
+	#endif
 
 	for (int i = 0; i < algo_ctx->threadcount; i += 1)
 		pthread_join(algo_ctx->threads[i], NULL);
