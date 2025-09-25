@@ -50,8 +50,8 @@ OR
 -- Continue Tweaking these
 */
 
-#define DIAGNOSTICS 0
-#define PRINT 0 /* enable/disable prints. */
+#define DIAGNOSTICS 1
+#define PRINT 1 /* enable/disable prints. */
 #define MIN(a, b) (((a) <= (b)) ? (a) : (b))
 #define MAX(a, b) (((a) >= (b)) ? (a) : (b))
 #define BATCH_SIZE(N, THREADCOUNT)  ((N / (THREADCOUNT * NODES_PER_BATCH)) > 1 ? (N / (THREADCOUNT * NODES_PER_BATCH)) : 1)
@@ -135,7 +135,10 @@ struct graph_t
 	edge_t *e;		/* array of m edges.		*/
 	node_t *s;		/* source.			*/
 	node_t *t;		/* sink.			*/
-	node_t *excess; /* nodes with e > 0 except s,t.	*/
+
+	node_t **active_nodes; /* sparse array with pointers to nodes instead of using excess */
+	uint32_t n_active;
+	// node_t *excess; /* nodes with e > 0 except s,t.	*/
 
 	pthread_mutex_t g_lock; /* global lock to ensure nodes coming in and out of excess pool is consistent */
 	bool done;				/* algorithm done flag */
@@ -282,9 +285,8 @@ static void enter_excess(graph_t *g, node_t *v)
  	if(!v->is_in_queue)
 	{
 		v->is_in_queue = 1;
-		v->next = g->excess;
-		g->excess = v;
-    g->work_counter++; // increment work counter
+        g->active_nodes[g->n_active++] = v;
+        g->work_counter++;
 	} 
 }
 
@@ -310,7 +312,7 @@ static void init_push(graph_t *g, node_t *u, node_t *v, edge_t *e)
     u->e -= d;
     v->e += d;
 
-	  enter_excess(g, v);
+	enter_excess(g, v);
 }
 
 /* ---------------------------- */
@@ -336,7 +338,7 @@ static int push_owned(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e, int8_t
 
 	  #ifdef PRINT
 	if(d != 0) {
-		pr("push from %d to %d: ", id(g, u), id(g, v));
+		pr("push from %d to %d: ", id(ctx->g, u), id(ctx->g, v));
 		pr("f = %d, c = %d, so ", atomic_load(&e->f), e->c);
 		pr("pushing %d\n", d);
 	}
@@ -365,7 +367,7 @@ static int push_atomic(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e, int8_
 
   #ifdef PRINT
 	if(d != 0) {
-		pr("push from %d to %d: ", id(g, u), id(g, v));
+		pr("push from %d to %d: ", id(ctx->g, u), id(ctx->g, v));
 		pr("f = %d, c = %d, so ", atomic_load(&e->f), e->c);
 		pr("pushing %d\n", d);
 	}
@@ -422,59 +424,46 @@ static void relabel(thread_ctx_t *ctx, node_t *u)
 
 static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 {
-  uint8_t  i, degree;
-  uint32_t d, excess;
-  adj_t*  a;
-  edge_t* e;
-  node_t* v;
-  bool pushed = false;
+    uint8_t i = u->cur;
+    uint8_t degree = u->degree;
+    bool pushed = false;
 
-  i      = u->cur;
-  degree = u->degree;
-  while(i < degree)
-  {
-    a = &u->edges[i];
-    // a = &u->edges[i];
-    e = a->e;
-    v = a->neighbor;
+    while (i < degree)
+    {
+        adj_t *a = &u->edges[i];
+        edge_t *e = a->e;
+        node_t *v = a->neighbor;
+        uint32_t d;
 
-	if(ctx->owned[v->id]) {
-		d = push_owned(ctx, u, v, e, a->dir);
-		#ifdef DIAGNOSTICS
-		ctx->owned_pushes++;
-		#endif
-	}
-	else
-	{
-		d = push_atomic(ctx, u, v, e, a->dir);
-		#ifdef DIAGNOSTICS
-		ctx->atomic_pushes++;
-		#endif
-	}
-	if(d > 0)
-	{
-		pushed = true;
-		ctx->plq[ctx->count++] = (update_t){ .type=PUSH, .u=v, .delta=d, .g=ctx->g };
-	}
-	if(atomic_load(&u->e) == 0)
-	{
-		u->cur = i;
-		return;
-	}
-	
-	++i;
-	}
+        if (ctx->owned[v->id]) {
+			#ifdef DIAGNOSTICS
+			ctx->owned_pushes++;
+			#endif
+            d = push_owned(ctx, u, v, e, a->dir);
+        } else {
+			#ifdef DIAGNOSTICS
+			ctx->atomic_pushes++;
+			#endif
+            d = push_atomic(ctx, u, v, e, a->dir);
+        }
 
-  if(!pushed)
-  {
-	relabel(ctx, u);
-    u->cur = 0; // reset arc index after relabel
-  } 
-  else if(atomic_load(&u->e) > 0)
-	{
-		update_t update = (update_t){ .type = PUSH, .u=u, .delta=d, .g=ctx->g };
-    	ctx->plq[ctx->count++] = update;
-	}
+        if (d > 0) {
+            pushed = true;
+            ctx->plq[ctx->count++] = (update_t){ .type=PUSH, .u=v, .delta=d, .g=ctx->g };
+        }
+
+        if (atomic_load(&u->e) == 0) {
+            u->cur = i;
+            return;
+        }
+
+        i++;
+    }
+
+	if (atomic_load(&u->e) > 0 && pushed)
+		ctx->plq[ctx->count++] = (update_t){ .type=PUSH, .u=u, .delta=0, .g=ctx->g };
+	else if (!pushed)
+		relabel(ctx, u);
 }
 
 /* ---------------------------- */
@@ -483,113 +472,128 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 
 static void _apply_updates(thread_ctx_t *ctx)
 {
-	uint8_t i, k, all_thread_contexts_size;
-    thread_ctx_t *all_thread_contexts;
-    thread_ctx_t *thread_ctx;
-    update_t update;
-	all_thread_contexts               = ctx->all_thread_ctx;
-	all_thread_contexts_size          = ctx->all_thread_ctx_size;
+    thread_ctx_t *all_thread_contexts = ctx->all_thread_ctx;
+    uint8_t n_threads = ctx->all_thread_ctx_size;
 
-	for(i = 0; i < all_thread_contexts_size; i++)
-	{
-		thread_ctx = &all_thread_contexts[i];
-		for (k = 0; k < thread_ctx->count; k++)
-		{
-			update = thread_ctx->plq[k];
-      		update.u->h = (update.type == RELABEL) ? update.new_height : update.u->h;
-			enter_excess(ctx->g, update.u);
-		}
-		thread_ctx->count = 0;
-	}
+    for (uint8_t t = 0; t < n_threads; t++)
+    {
+        thread_ctx_t *tctx = &all_thread_contexts[t];
+
+        for (uint32_t k = 0; k < tctx->count; k++)
+        {
+            update_t *update = &tctx->plq[k];
+            
+            // Apply relabel
+            if (update->type == RELABEL)
+            {
+                update->u->h = update->new_height;
+            }
+
+            // Only add node back to global active queue if it still has excess
+            // and is not already in the queue
+            if (update->u->e > 0 && !update->u->is_in_queue)
+            {
+                enter_excess(ctx->g, update->u);
+            }
+        }
+
+        // Reset this thread's PLQ
+        tctx->count = 0;
+    }
 }
 
-static uint8_t grab_excess_batch(graph_t *g, node_t **local_queue, uint32_t max_nodes, uint8_t *owned) {
-	uint8_t count = 0;
-	node_t *v;
+static uint8_t grab_excess_batch(graph_t *g, node_t **local_queue, uint32_t max_nodes, uint8_t *owned)
+{
+    uint8_t count = 0;
 
     pthread_mutex_lock(&g->g_lock);
-    while(count < max_nodes && g->excess)
-	{
-        v = g->excess;
-        g->excess = v->next;
-        v->next = NULL;
-        v->is_in_queue = 0;
+    uint32_t n = (g->n_active < max_nodes) ? g->n_active : max_nodes;
 
-        local_queue[count++] = v;
-        g->work_counter--;
+    for (uint32_t i = 0; i < n; i++) {
+        node_t *v = g->active_nodes[i];
+        if (!owned[v->id]) {   // claim ownership
+            local_queue[count++] = v;
+            owned[v->id] = 1;
+            v->is_in_queue = 0;
+            g->work_counter--;  // decrement when taken
+        }
     }
-    for (int i = 0; i < count; ++i) {
-        owned[local_queue[i]->id] = 1;
-    }
+
+    for (uint32_t i = count; i < g->n_active; i++)
+        g->active_nodes[i - count] = g->active_nodes[i];
+
+    g->n_active -= count;
     pthread_mutex_unlock(&g->g_lock);
 
-    return count;  // number of nodes grabbed
+    return count;
 }
 
 void *worker(void *arg)
 {
     thread_ctx_t *tctx = (thread_ctx_t *)arg;
     graph_t *g = tctx->g;
-    bool local_work;
-
-    uint8_t i, n;
-    node_t *local_queue[tctx->inqueue_size]; // reuse preallocated inqueue
-    node_t *u;
+    node_t *local_queue[tctx->inqueue_size];
+    uint8_t n_local = 0;
 
     while (1)
     {
-        n = grab_excess_batch(g, local_queue, tctx->inqueue_size, tctx->owned);
-        if (n == 0)
-		{
-            // nothing to do this round, wait at barrier
-            tctx->did_work = 0;
-            int res = pthread_barrier_wait(tctx->barrier);
-            if (res == PTHREAD_BARRIER_SERIAL_THREAD)
-			{
-                _apply_updates(tctx);
-                if (g->work_counter == 0 && g->excess == NULL)
-				{
-                    g->done = 1;
+        // Phase 1: process local queue
+        if (n_local > 0)
+        {
+            node_t *u = local_queue[--n_local]; // pop last node
+            tctx->owned[u->id] = 1;             // claim ownership
+            if (u != g->s && u != g->t)
+            {
+                _build_update_queue(tctx, u);
+				tctx->owned[u->id] = 0;
+                tctx->did_work = true;
+            }
+        }
+
+        // Barrier 1: synchronize threads
+        int res = pthread_barrier_wait(tctx->barrier);
+
+        // Serial thread applies updates and checks termination
+        if (res == PTHREAD_BARRIER_SERIAL_THREAD)
+        {
+            _apply_updates(tctx);
+
+            bool all_idle = true;
+            for (int i = 0; i < tctx->all_thread_ctx_size; i++)
+            {
+                if (tctx->all_thread_ctx[i].did_work)
+                {
+                    all_idle = false;
+                    break;
                 }
             }
-            pthread_barrier_wait(tctx->barrier);
-            if (g->done) break;
-            continue;
-        }
 
-        local_work = false;
-        for (i = 0; i < n; i+=1)
-		{
-            u = local_queue[i];
-            if (u && u != g->s && u != g->t)
-			{
-                local_work = true;
-                _build_update_queue(tctx, u);
-            }
-        }
-
-		for (i = 0; i < n; ++i) {
-            tctx->owned[ local_queue[i]->id ] = 0;
-        }
-
-        tctx->did_work = local_work;
-
-        // Sync and apply updates
-        int res = pthread_barrier_wait(tctx->barrier);
-        if (res == PTHREAD_BARRIER_SERIAL_THREAD)
-		{
-            _apply_updates(tctx);
-            if(g->work_counter == 0 && g->excess == NULL)
-			{
+            if (all_idle && g->n_active == 0)
                 g->done = 1;
-            }
+
+            for (int i = 0; i < tctx->all_thread_ctx_size; i++)
+                tctx->all_thread_ctx[i].did_work = false;
         }
+
+        // Barrier 2: all threads see updates / g->done
         pthread_barrier_wait(tctx->barrier);
-        if (g->done) break;
+
+        // Termination check
+        if (g->done)
+            break;
+
+        // Phase 2: grab new work from global queue
+        if (n_local < tctx->inqueue_size)
+        {
+            uint8_t grabbed = grab_excess_batch(g, local_queue + n_local,
+                                                tctx->inqueue_size - n_local,
+                                                tctx->owned);
+            n_local += grabbed;
+        }
     }
+
     return NULL;
 }
-
 
 static void init_workers(preflow_context_t *algo)
 {
@@ -644,9 +648,11 @@ static graph_t *new_graph(FILE *in, int n, int m)
 	g->m = m;
 	g->v = xcalloc(n, sizeof(node_t));
 	g->e = xcalloc(m, sizeof(edge_t));
+	g->active_nodes = xcalloc(n, sizeof(node_t*));
+	g->n_active = 0;
 	g->s = &g->v[0];
 	g->t = &g->v[n - 1];
-	g->excess = NULL;
+	//g->excess = NULL;
 
 	// read edges and count degrees
 	int *deg = xcalloc(n, sizeof(int));
@@ -720,6 +726,7 @@ static void free_graph(graph_t *g)
 	{
 		free(g->v[i].edges);
 	}
+	free(g->active_nodes);
 	free(g->v);
 	free(g->e);
 	free(g);
@@ -743,9 +750,9 @@ static void init_preflow(graph_t *g)
 
 	for (int i = 0; i < s->degree; i++)
 	{
-    adj_t  *a = &s->edges[i];
-    edge_t *e = a->e;
-		//edge_t *e = s->edges[i];
+		adj_t  *a = &s->edges[i];
+		edge_t *e = a->e;
+			//edge_t *e = s->edges[i];
 		init_push(g, s, other(s, e), e);
 	}
 }
@@ -770,6 +777,9 @@ static void preflow(preflow_context_t *algo_ctx)
 {
 	setup(algo_ctx);
 
+	for (int i = 0; i < algo_ctx->threadcount; i += 1)
+		pthread_join(algo_ctx->threads[i], NULL);
+
 	#ifdef DIAGNOSTICS
 	uint64_t total_owned = 0, total_atomic = 0;
 	for (int t = 0; t < algo_ctx->threadcount; t++) {
@@ -783,9 +793,6 @@ static void preflow(preflow_context_t *algo_ctx)
 				(double) total_owned / (total_owned + total_atomic) : 0.0;
 	pr_diag("Owned push ratio: %.2f%%\n", ratio * 100.0);
 	#endif
-
-	for (int i = 0; i < algo_ctx->threadcount; i += 1)
-		pthread_join(algo_ctx->threads[i], NULL);
 
 	algo_ctx->result = algo_ctx->g->t->e;
 	teardown(algo_ctx);
