@@ -13,7 +13,7 @@
 
 #include "pthread_barrier.h"
 
-/* Lab4 
+/* Lab4
 Idea: Make excess and residuals atomic, so pushing can be done entirely during phase 1.
 Phase 2 then only has to handle relabels. Makes sequential part of the program much smaller.
 */
@@ -34,10 +34,10 @@ Phase 2 then only has to handle relabels. Makes sequential part of the program m
 #define NODES_PER_BATCH 8
 */
 
-/* My Laptop (Ryzen 7 7730U, 8 core, 16 logical CPU's) */ 
+/* My Laptop (Ryzen 7 7730U, 8 core, 16 logical CPU's) */
 #define TC 16
 #define NODES_PER_BATCH 8
-#define CACHE_PADDING CACHE_ALIGN_X86 
+#define CACHE_PADDING CACHE_ALIGN_X86
 
 /* Possible POWER8 Configs - Test
 #define CACHE_ALIGN_PADDING CACHE_ALIGN_POWER8
@@ -52,7 +52,7 @@ OR
 #define PRINT 0 /* enable/disable prints. */
 #define MIN(a, b) (((a) <= (b)) ? (a) : (b))
 #define MAX(a, b) (((a) >= (b)) ? (a) : (b))
-#define BATCH_SIZE(N, THREADCOUNT)  ((N / (THREADCOUNT * NODES_PER_BATCH)) > 1 ? (N / (THREADCOUNT * NODES_PER_BATCH)) : 1)
+#define BATCH_SIZE(N, THREADCOUNT) ((N / (THREADCOUNT * NODES_PER_BATCH)) > 1 ? (N / (THREADCOUNT * NODES_PER_BATCH)) : 1)
 
 typedef struct graph_t graph_t;
 typedef struct node_t node_t;
@@ -61,7 +61,11 @@ typedef struct list_t list_t;
 typedef struct preflow_context_t preflow_context_t;
 typedef struct thread_ctx_t thread_ctx_t;
 typedef struct update_t update_t;
-typedef enum { PUSH = 0, RELABEL = 1 } update_type_t;
+typedef enum
+{
+	PUSH = 0,
+	RELABEL = 1
+} update_type_t;
 
 /* ---------------------------- */
 /*  Global Variables / Debugging */
@@ -88,26 +92,27 @@ static char *progname;
 /*  Algorithm Structs           */
 /* ---------------------------- */
 
-struct node_t {
-    uint8_t h, cur, degree;
-    bool is_in_queue;
-    atomic_int e;
-    node_t *next;
-    edge_t **edges;
+struct node_t
+{
+	uint8_t h, cur, degree;
+	bool is_in_queue;
+	atomic_int e;
+	node_t *next;
+	edge_t **edges;
 } __attribute__((aligned(CACHE_PADDING))); // or 128 for POWER8
 
 struct edge_t
 {
-	node_t *u; /* one of the two nodes.	*/
-	node_t *v; /* the other. 			*/
-	uint32_t c;	   /* capacity.			*/
-	atomic_int f;	   /* flow > 0 if from u to v.	*/
+	node_t *u;	  /* one of the two nodes.	*/
+	node_t *v;	  /* the other. 			*/
+	uint32_t c;	  /* capacity.			*/
+	atomic_int f; /* flow > 0 if from u to v.	*/
 };
 
 struct graph_t
 {
-	uint32_t n;			/* nodes.			*/
-	uint32_t m;			/* edges.			*/
+	uint32_t n;		/* nodes.			*/
+	uint32_t m;		/* edges.			*/
 	node_t *v;		/* array of n nodes.		*/
 	edge_t *e;		/* array of m edges.		*/
 	node_t *s;		/* source.			*/
@@ -116,7 +121,7 @@ struct graph_t
 
 	pthread_mutex_t g_lock; /* global lock to ensure nodes coming in and out of excess pool is consistent */
 	bool done;				/* algorithm done flag */
-  uint8_t work_counter;
+	uint8_t work_counter;
 };
 
 #if PRINT
@@ -133,14 +138,13 @@ struct preflow_context_t
 	pthread_barrier_t *barrier;
 	thread_ctx_t *thread_ctxs;
 	uint8_t threadcount;
-	uint32_t result; // Will be equal to the sinks final excess
+	uint32_t result;					   // Will be equal to the sinks final excess
 } __attribute__((aligned(CACHE_PADDING))); // or 128 for POWER8
 
 struct update_t
 {
 	char type; /* type = 0 is push; type = 1 is relabel*/
 	node_t *u;
-	uint32_t delta;
 	uint8_t new_height;
 
 	graph_t *g;
@@ -157,11 +161,8 @@ struct thread_ctx_t
 	uint8_t all_thread_ctx_size;
 
 	node_t **inqueue;
-	uint8_t inqueue_size;  // capacity of inqueue array
-	uint8_t inqueue_count; // number of valid nodes in inqueue
-	uint8_t inqueue_index; // next index to pop
+	uint8_t inqueue_size; // capacity of inqueue array
 
-	bool did_work;
 	pthread_barrier_t *barrier;
 } __attribute__((aligned(CACHE_PADDING)));
 
@@ -230,38 +231,13 @@ static node_t *other(node_t *u, edge_t *e)
 
 static void enter_excess(graph_t *g, node_t *v)
 {
- 	if(!v->is_in_queue)
+	if (!v->is_in_queue)
 	{
 		v->is_in_queue = 1;
 		v->next = g->excess;
 		g->excess = v;
-    g->work_counter++; // increment work counter
-	} 
-}
-
-static void init_push(graph_t *g, node_t *u, node_t *v, edge_t *e)
-{
-    pr("push from %d to %d: ", id(g, u), id(g, v));
-    pr("f = %d, c = %d, so ", atomic_load(&e->f), e->c);
-
-    uint32_t d;
-    if(u == e->u)
-    {
-        d = MIN(u->e, e->c - e->f); // plain int, no atomic
-        e->f += d;
-    }
-    else
-    {
-        d = MIN(u->e, e->c + e->f);
-        e->f -= d;
-    }
-
-    pr("pushing %d\n", d);
-
-    u->e -= d;
-    v->e += d;
-
-	  enter_excess(g, v);
+		g->work_counter++; // increment work counter
+	}
 }
 
 /* ---------------------------- */
@@ -270,45 +246,39 @@ static void init_push(graph_t *g, node_t *u, node_t *v, edge_t *e)
 
 static int push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 {
-  if (u->h != v->h + 1)  // enforce valid push
-        return 0;
+	if (u->h != v->h + 1) // enforce valid push
+		return 0;
 
-  uint32_t u_excess = atomic_load(&u->e);
-  uint32_t f 		 = atomic_load(&e->f);
-  uint32_t d = (u == e->u) ? MIN(u_excess, e->c - f)
-                      : MIN(u_excess, e->c + f);
+	uint32_t u_excess = atomic_load(&u->e);
+	uint32_t f = atomic_load(&e->f);
+	uint32_t d = (u == e->u) ? MIN(u_excess, e->c - f)
+							 : MIN(u_excess, e->c + f);
 
-  if (u == e->u) atomic_fetch_add(&e->f, d);
-  else           atomic_fetch_sub(&e->f, d);
+	if (u == e->u)
+		atomic_fetch_add(&e->f, d);
+	else
+		atomic_fetch_sub(&e->f, d);
 
-  atomic_fetch_sub(&u->e, d);
-  atomic_fetch_add(&v->e, d);
-
-  #ifdef PRINT
-	if(push != 0) {
-		pr("push from %d to %d: ", id(g, u), id(g, v));
-		pr("f = %d, c = %d, so ", atomic_load(&e->f), e->c);
-		pr("pushing %d\n", push);
-	}
-  #endif
+	atomic_fetch_sub(&u->e, d);
+	atomic_fetch_add(&v->e, d);
 
 	return d;
 }
 
 static uint8_t _find_min_residual_cap(graph_t *g, node_t *u)
 {
-  uint8_t i, f, residual, min_h;
-  edge_t *e;
-  node_t *v;
-	
-  min_h = UINT8_MAX;
+	uint8_t i, f, residual, min_h;
+	edge_t *e;
+	node_t *v;
+
+	min_h = UINT8_MAX;
 	for (i = 0; i < u->degree; i++)
 	{
 		e = u->edges[i];
-    	f = atomic_load(&e->f);
-		residual  = (u == e->u) ? e->c - f : e->c + f;
-		v         = (u == e->u) ? e->v : e->u;
-		
+		f = atomic_load(&e->f);
+		residual = (u == e->u) ? e->c - f : e->c + f;
+		v = (u == e->u) ? e->v : e->u;
+
 		if (residual > 0)
 			min_h = MIN(min_h, v->h);
 	}
@@ -325,52 +295,51 @@ static uint8_t _relabel(int min_h, node_t *u)
 
 static void relabel(thread_ctx_t *ctx, node_t *u)
 {
-    uint8_t min_h = _find_min_residual_cap(ctx->g, u);
-    uint8_t new_h = _relabel(min_h, u);
+	uint8_t new_h = _relabel(_find_min_residual_cap(ctx->g, u), u);
 
-    // Initialize update struct in one go
-    update_t update = { .type = RELABEL, .u = u, .delta = 0, .new_height = new_h, .g = ctx->g };
-    ctx->plq[ctx->count++] = update;
+	// Initialize update struct in one go
+	update_t update = {.type = RELABEL, .u = u, .new_height = new_h, .g = ctx->g};
+	ctx->plq[ctx->count++] = update;
 }
 
 static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 {
 	uint8_t i, degree;
-  	uint32_t d, excess;
-	edge_t* e;
-	node_t* v;
-  	bool pushed = false;
+	uint32_t d, excess;
+	edge_t *e;
+	node_t *v;
+	bool pushed = false;
 
-	i      = u->cur;
+	i = u->cur;
 	degree = u->degree;
-	while(i < degree)
+	while (i < degree)
 	{
 		e = u->edges[i];
 		v = (u == e->u) ? e->v : e->u;
 		d = push(ctx, u, v, e);
 
-		if(d > 0)
+		if (d > 0)
 		{
 			pushed = true;
-			ctx->plq[ctx->count++] = (update_t){ .type=PUSH, .u=v, .delta=d, .g=ctx->g };
+			ctx->plq[ctx->count++] = (update_t){.type = PUSH, .u = v, .g = ctx->g};
 		}
-		if(atomic_load(&u->e) == 0)
+		if (atomic_load(&u->e) == 0)
 		{
 			u->cur = i;
-      return;
+			return;
 		}
 		++i;
 	}
 
-  if(!pushed)
-  {
-	relabel(ctx, u);
-    u->cur = 0; // reset arc index after relabel
-  } 
-  else if(atomic_load(&u->e) > 0)
+	if (!pushed)
 	{
-		update_t update = (update_t){ .type = PUSH, .u=u, .delta=d, .g=ctx->g };
-    	ctx->plq[ctx->count++] = update;
+		relabel(ctx, u);
+		u->cur = 0; // reset arc index after relabel
+	}
+	else if (atomic_load(&u->e) > 0)
+	{
+		update_t update = (update_t){.type = PUSH, .u = u, .g = ctx->g};
+		ctx->plq[ctx->count++] = update;
 	}
 }
 
@@ -381,105 +350,101 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 static void _apply_updates(thread_ctx_t *ctx)
 {
 	uint8_t i, k, all_thread_contexts_size;
-    thread_ctx_t *all_thread_contexts;
-    thread_ctx_t *thread_ctx;
-    update_t update;
-	all_thread_contexts               = ctx->all_thread_ctx;
-	all_thread_contexts_size          = ctx->all_thread_ctx_size;
+	thread_ctx_t *all_thread_contexts;
+	thread_ctx_t *thread_ctx;
+	update_t update;
+	all_thread_contexts = ctx->all_thread_ctx;
+	all_thread_contexts_size = ctx->all_thread_ctx_size;
 
-	for(i = 0; i < all_thread_contexts_size; i++)
+	for (i = 0; i < all_thread_contexts_size; i++)
 	{
 		thread_ctx = &all_thread_contexts[i];
 		for (k = 0; k < thread_ctx->count; k++)
 		{
 			update = thread_ctx->plq[k];
-      		update.u->h = (update.type == RELABEL) ? update.new_height : update.u->h;
+			update.u->h = (update.type == RELABEL) ? update.new_height : update.u->h;
 			enter_excess(ctx->g, update.u);
 		}
 		thread_ctx->count = 0;
 	}
 }
 
-static uint8_t grab_excess_batch(graph_t *g, node_t **local_queue, uint32_t max_nodes) {
+static uint8_t grab_excess_batch(graph_t *g, node_t **local_queue, uint32_t max_nodes)
+{
 	uint8_t count = 0;
 	node_t *v;
 
-    pthread_mutex_lock(&g->g_lock);
-    while(count < max_nodes && g->excess)
+	pthread_mutex_lock(&g->g_lock);
+	while (count < max_nodes && g->excess)
 	{
-        v = g->excess;
-        g->excess = v->next;
-        v->next = NULL;
-        v->is_in_queue = 0;
+		v = g->excess;
+		g->excess = v->next;
+		v->next = NULL;
+		v->is_in_queue = 0;
 
-        local_queue[count++] = v;
-        g->work_counter--;
-    }
-    pthread_mutex_unlock(&g->g_lock);
+		local_queue[count++] = v;
+		g->work_counter--;
+	}
+	pthread_mutex_unlock(&g->g_lock);
 
-    return count;  // number of nodes grabbed
+	return count; // number of nodes grabbed
 }
 
 void *worker(void *arg)
 {
-    thread_ctx_t *tctx = (thread_ctx_t *)arg;
-    graph_t *g = tctx->g;
-    bool local_work;
+	thread_ctx_t *tctx = (thread_ctx_t *)arg;
+	graph_t *g = tctx->g;
 
-    uint8_t i, n;
-    node_t *local_queue[tctx->inqueue_size]; // reuse preallocated inqueue
-    node_t *u;
+	uint8_t i, n;
+	node_t *local_queue[tctx->inqueue_size]; // reuse preallocated inqueue
+	node_t *u;
 
-    while (1)
-    {
-        n = grab_excess_batch(g, local_queue, tctx->inqueue_size);
-        if (n == 0)
+	while (1)
+	{
+		n = grab_excess_batch(g, local_queue, tctx->inqueue_size);
+		if (n == 0)
 		{
-            // nothing to do this round, wait at barrier
-            tctx->did_work = 0;
-            int res = pthread_barrier_wait(tctx->barrier);
-            if (res == PTHREAD_BARRIER_SERIAL_THREAD)
+			// nothing to do this round, wait at barrier
+			int res = pthread_barrier_wait(tctx->barrier);
+			if (res == PTHREAD_BARRIER_SERIAL_THREAD)
 			{
-                _apply_updates(tctx);
-                if (g->work_counter == 0 && g->excess == NULL)
+				_apply_updates(tctx);
+				if (g->work_counter == 0 && g->excess == NULL)
 				{
-                    g->done = 1;
-                }
-            }
-            pthread_barrier_wait(tctx->barrier);
-            if (g->done) break;
-            continue;
-        }
+					g->done = 1;
+				}
+			}
+			pthread_barrier_wait(tctx->barrier);
+			if (g->done)
+				break;
+			continue;
+		}
 
-        local_work = false;
-        for (i = 0; i < n; i+=1)
+		for (i = 0; i < n; i += 1)
 		{
-            u = local_queue[i];
-            if (u && u != g->s && u != g->t)
+			u = local_queue[i];
+			if (u && u != g->s && u != g->t)
 			{
-                local_work = true;
-                _build_update_queue(tctx, u);
-            }
-        }
+				_build_update_queue(tctx, u);
+			}
+		}
 
-        tctx->did_work = local_work;
-
-        // Sync and apply updates
-        int res = pthread_barrier_wait(tctx->barrier);
-        if (res == PTHREAD_BARRIER_SERIAL_THREAD)
+		// Sync and apply updates
+		int res = pthread_barrier_wait(tctx->barrier);
+		if (res == PTHREAD_BARRIER_SERIAL_THREAD)
 		{
-            _apply_updates(tctx);
-            if(g->work_counter == 0 && g->excess == NULL)
+			_apply_updates(tctx);
+			if (g->work_counter == 0 && g->excess == NULL)
 			{
-                g->done = 1;
-            }
-        }
-        pthread_barrier_wait(tctx->barrier);
-        if (g->done) break;
-    }
-    return NULL;
+				g->done = 1;
+			}
+		}
+		pthread_barrier_wait(tctx->barrier);
+		if (g->done)
+			break;
+	}
+	return NULL;
 }
-
 
 static void init_workers(preflow_context_t *algo)
 {
@@ -510,8 +475,6 @@ static void init_workers(preflow_context_t *algo)
 		// Allocate local inqueue
 		g_plq[i].inqueue_size = inqueue_batch_size;
 		g_plq[i].inqueue = (node_t **)xcalloc(inqueue_batch_size, sizeof(node_t *));
-		g_plq[i].inqueue_count = 0;
-		g_plq[i].inqueue_index = 0;
 
 		if (pthread_create(&threads[i], NULL, worker, &g_plq[i]) != 0)
 		{
@@ -585,7 +548,7 @@ static graph_t *new_graph(FILE *in, int n, int m)
 static void free_ctx(preflow_context_t *algo)
 {
 	int i;
-	for(i = 0; i < algo->threadcount; i += 1)
+	for (i = 0; i < algo->threadcount; i += 1)
 	{
 		free(algo->thread_ctxs[i].plq);		// Free per-thread update queue
 		free(algo->thread_ctxs[i].inqueue); // Free per-thread inqueue
@@ -609,8 +572,8 @@ static void init_preflow(graph_t *g)
 	node_t *s = g->s;
 
 	s->h = g->n;
-	s->e = 0;
-  g->work_counter = 0;
+	atomic_store(&s->e, 0);
+	g->work_counter = 0;
 
 	for (int i = 0; i < s->degree; i++)
 	{
@@ -621,7 +584,22 @@ static void init_preflow(graph_t *g)
 	for (int i = 0; i < s->degree; i++)
 	{
 		edge_t *e = s->edges[i];
-		init_push(g, s, other(s, e), e);
+		// Inline the logic of init_push here since it's now removed
+		node_t *v = other(s, e);
+		uint32_t d;
+		if (s == e->u)
+		{
+			d = MIN(atomic_load(&s->e), e->c - atomic_load(&e->f)); // plain int, no atomic
+			atomic_fetch_add(&e->f, d);
+		}
+		else
+		{
+			d = MIN(atomic_load(&s->e), e->c + atomic_load(&e->f));
+			atomic_fetch_sub(&e->f, d);
+		}
+		atomic_fetch_sub(&s->e, d);
+		atomic_fetch_add(&v->e, d);
+		enter_excess(g, v);
 	}
 }
 
@@ -657,12 +635,12 @@ static void preflow(preflow_context_t *algo_ctx)
 /* ---------------------------------- */
 int main(int argc, char *argv[])
 {
-	uint8_t tc;					/* algorith threadcount */
+	uint8_t tc;				/* algorith threadcount */
 	FILE *in;				/* input file set to stdin	*/
 	graph_t *g;				/* undirected graph. 		*/
-	uint32_t f;					/* output from preflow.		*/
-	uint32_t n;					/* number of nodes.		*/
-	uint32_t m;					/* number of edges.		*/
+	uint32_t f;				/* output from preflow.		*/
+	uint32_t n;				/* number of nodes.		*/
+	uint32_t m;				/* number of edges.		*/
 	preflow_context_t algo; /* algorithm context - struct wrapper for algorithm setup and attributes */
 
 	tc = TC;
