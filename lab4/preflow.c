@@ -205,15 +205,35 @@ static void *xcalloc(size_t n, size_t s)
 	return p;
 }
 
-static int next_int()
+static inline __attribute__((always_inline)) char next_char()
 {
-	int x;
-	int c;
+	static char buf[1 << 22]; // 4MB
+	static int pos = 0, len = 0;
+	if (pos >= len)
+	{
+		len = fread(buf, 1, sizeof(buf), stdin);
+		pos = 0;
+		if (len == 0)
+			return EOF;
+	}
+	return buf[pos++];
+}
 
-	x = 0;
-	while ((c = getchar()) >= '0' && c <= '9')
-		x = 10 * x + (c - '0');
-
+static inline __attribute__((always_inline)) int next_int()
+{
+	int x = 0;
+	char c;
+	do
+	{
+		c = next_char();
+		if (c == EOF)
+			return -1;
+	} while ((unsigned)(c - '0') > 9u);
+	do
+	{
+		x = x * 10 + (c - '0');
+		c = next_char();
+	} while ((unsigned)(c - '0') <= 9u);
 	return x;
 }
 
@@ -268,21 +288,19 @@ static int push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 static inline uint16_t _find_min_residual_cap(graph_t *g, node_t *u)
 {
 	uint16_t min_h = UINT16_MAX;
-
-	for (uint8_t i = 0; i < u->degree; i++)
-	{
+	for (uint8_t i = u->cur; i < u->degree; i++)
+	{ // start at cur
 		edge_t *e = u->edges[i];
 		int f = atomic_load_explicit(&e->f, memory_order_relaxed);
 		int residual = (u == e->u) ? (e->c - f) : (e->c + f);
-		node_t *v = (u == e->u) ? e->v : e->u;
+		if (residual <= 0)
+			continue;
 
-		if (residual > 0)
-		{
-			if (v->h + 1 == u->h) // early exit
-				return v->h;
-			if (v->h < min_h)
-				min_h = v->h;
-		}
+		node_t *v = (u == e->u) ? e->v : e->u;
+		if ((uint16_t)(v->h + 1) == u->h)
+			return v->h; // earliest possible
+		if (v->h < min_h)
+			min_h = v->h;
 	}
 	return min_h;
 }
