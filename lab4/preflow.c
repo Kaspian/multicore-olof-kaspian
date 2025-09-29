@@ -259,28 +259,30 @@ static int push(thread_ctx_t *ctx, node_t *u, node_t *v, edge_t *e)
 	else
 		atomic_fetch_sub(&e->f, d);
 
-	atomic_fetch_sub(&u->e, d);
-	atomic_fetch_add(&v->e, d);
+	atomic_fetch_sub_explicit(&u->e, d, memory_order_relaxed);
+	atomic_fetch_add_explicit(&v->e, d, memory_order_relaxed);
 
 	return d;
 }
 
-static uint8_t _find_min_residual_cap(graph_t *g, node_t *u)
+static inline uint16_t _find_min_residual_cap(graph_t *g, node_t *u)
 {
-	uint8_t i, f, residual, min_h;
-	edge_t *e;
-	node_t *v;
+	uint16_t min_h = UINT16_MAX;
 
-	min_h = UINT8_MAX;
-	for (i = 0; i < u->degree; i++)
+	for (uint8_t i = 0; i < u->degree; i++)
 	{
-		e = u->edges[i];
-		f = atomic_load(&e->f);
-		residual = (u == e->u) ? e->c - f : e->c + f;
-		v = (u == e->u) ? e->v : e->u;
+		edge_t *e = u->edges[i];
+		int f = atomic_load_explicit(&e->f, memory_order_relaxed);
+		int residual = (u == e->u) ? (e->c - f) : (e->c + f);
+		node_t *v = (u == e->u) ? e->v : e->u;
 
 		if (residual > 0)
-			min_h = MIN(min_h, v->h);
+		{
+			if (v->h + 1 == u->h) // early exit
+				return v->h;
+			if (v->h < min_h)
+				min_h = v->h;
+		}
 	}
 	return min_h;
 }
@@ -461,7 +463,7 @@ static void init_workers(preflow_context_t *algo)
 	{
 		// TODO: Memory Bug?
 		// TODO: Way too much memory allocated.
-		update_t *thread_out_q = (update_t *)xcalloc(g->m, sizeof(update_t));
+		update_t *thread_out_q = (update_t *)xcalloc(g->n, sizeof(update_t));
 		g_plq[i].g = g;
 		g_plq[i].plq = thread_out_q;
 		// Hacky fixa snyggt sen
@@ -578,7 +580,7 @@ static void init_preflow(graph_t *g)
 	for (int i = 0; i < s->degree; i++)
 	{
 		edge_t *e = s->edges[i];
-		atomic_fetch_add(&s->e, e->c);
+		atomic_fetch_add_explicit(&s->e, e->c, memory_order_relaxed);
 	}
 
 	for (int i = 0; i < s->degree; i++)
@@ -597,8 +599,8 @@ static void init_preflow(graph_t *g)
 			d = MIN(atomic_load(&s->e), e->c + atomic_load(&e->f));
 			atomic_fetch_sub(&e->f, d);
 		}
-		atomic_fetch_sub(&s->e, d);
-		atomic_fetch_add(&v->e, d);
+		atomic_fetch_sub_explicit(&s->e, d, memory_order_relaxed);
+		atomic_fetch_add_explicit(&v->e, d, memory_order_relaxed);
 		enter_excess(g, v);
 	}
 }
