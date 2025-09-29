@@ -211,8 +211,8 @@ static int next_int()
 	int c;
 
 	x = 0;
-	while (isdigit(c = getchar()))
-		x = 10 * x + c - '0';
+	while ((c = getchar()) >= '0' && c <= '9')
+		x = 10 * x + (c - '0');
 
 	return x;
 }
@@ -325,7 +325,7 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 			pushed = true;
 			ctx->plq[ctx->count++] = (update_t){.type = PUSH, .u = v, .g = ctx->g};
 		}
-		if (atomic_load(&u->e) == 0)
+		if (atomic_load_explicit(&u->e, memory_order_relaxed) == 0)
 		{
 			u->cur = i;
 			return;
@@ -338,7 +338,7 @@ static void _build_update_queue(thread_ctx_t *ctx, node_t *u)
 		relabel(ctx, u);
 		u->cur = 0; // reset arc index after relabel
 	}
-	else if (atomic_load(&u->e) > 0)
+	else if (atomic_load_explicit(&u->e, memory_order_relaxed) > 0)
 	{
 		update_t update = (update_t){.type = PUSH, .u = u, .g = ctx->g};
 		ctx->plq[ctx->count++] = update;
