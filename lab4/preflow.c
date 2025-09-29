@@ -404,44 +404,28 @@ void *worker(void *arg)
 	while (1)
 	{
 		n = grab_excess_batch(g, local_queue, tctx->inqueue_size);
-		if (n == 0)
-		{
-			// nothing to do this round, wait at barrier
-			int res = pthread_barrier_wait(tctx->barrier);
-			if (res == PTHREAD_BARRIER_SERIAL_THREAD)
-			{
-				_apply_updates(tctx);
-				if (g->work_counter == 0 && g->excess == NULL)
-				{
-					g->done = 1;
-				}
-			}
-			pthread_barrier_wait(tctx->barrier);
-			if (g->done)
-				break;
-			continue;
-		}
 
-		for (i = 0; i < n; i += 1)
+		if (n > 0)
 		{
-			u = local_queue[i];
-			if (u && u != g->s && u != g->t)
+			for (i = 0; i < n; i++)
 			{
-				_build_update_queue(tctx, u);
+				u = local_queue[i];
+				if (u && u != g->s && u != g->t)
+					_build_update_queue(tctx, u);
 			}
 		}
 
-		// Sync and apply updates
+		// Barrier once per round
 		int res = pthread_barrier_wait(tctx->barrier);
 		if (res == PTHREAD_BARRIER_SERIAL_THREAD)
 		{
 			_apply_updates(tctx);
 			if (g->work_counter == 0 && g->excess == NULL)
-			{
 				g->done = 1;
-			}
 		}
-		pthread_barrier_wait(tctx->barrier);
+
+		pthread_barrier_wait(tctx->barrier); // ensure all see updates
+
 		if (g->done)
 			break;
 	}
