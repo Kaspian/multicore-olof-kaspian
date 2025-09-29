@@ -1,0 +1,4 @@
+1/ 2.
+Execution time increases because atomic operations are more expensive than normal loads/stores. Sequential programs with no threads there is no benefit
+3.
+Assembly code shows lock-prefixed instructions or fences on atomic accesses. Makes assembly code on the atomics longer. The guaranteed memory ordering / atomicity cause extra overhead on memory accesses. (Not completely sure if this is complete explanation)
