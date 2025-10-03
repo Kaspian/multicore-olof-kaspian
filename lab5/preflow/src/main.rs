@@ -32,12 +32,12 @@ impl Edge {
         }
 }
 
-fn relabel(u:&mut Node, excess_list:&mut Arc<Mutex<VecDeque<usize>>>) {
+fn relabel(u:&mut Node, excess_list:&Arc<Mutex<VecDeque<usize>>>) {
 	u.h += 1;
-	excess_list.push_back(u.i);
+	excess_list.lock().unwrap().push_back(u.i);
 }
 
-fn push(u:&mut Node, v:&mut Node, e:&mut Edge, excess_list:&mut Arc<Mutex<VecDeque<usize>>>) {
+fn push(u:&mut Node, v:&mut Node, e:&mut Edge, excess_list:&Arc<Mutex<VecDeque<usize>>>) {
 
 	let d = if u.i == e.u {
 		let d = cmp::min(u.e, e.c - e.f);
@@ -60,20 +60,20 @@ fn push(u:&mut Node, v:&mut Node, e:&mut Edge, excess_list:&mut Arc<Mutex<VecDeq
     assert!(e.f.abs() <= e.c);
 
 	if u.e > 0 {
-		excess_list.push_back(u.i);
+		excess_list.lock().unwrap().push_back(u.i);
 	}
 
 	if v.e == d {
-		excess_list.push_back(v.i);
+		excess_list.lock().unwrap().push_back(v.i);
 	}
 }
 
 fn discharge(
 	u: usize, 
 	node: &Vec<Arc<Mutex<Node>>>, 
-	edge: &mut Vec<Arc<Mutex<Edge>>>, 
-	adj_edges: &mut LinkedList<usize>, 
-	excess: &mut Arc<Mutex<VecDeque<usize>>>
+	edge: &Vec<Arc<Mutex<Edge>>>, 
+	adj_edges: &LinkedList<usize>, 
+	excess: &Arc<Mutex<VecDeque<usize>>>
 ) {
 	let mut b: i32;
 
@@ -111,9 +111,9 @@ fn main() {
 	let m: usize = read!();		/* m edges.						*/
 	let _c: usize = read!();	/* underscore avoids warning about an unused variable.	*/
 	let _p: usize = read!();	/* c and p are in the input from 6railwayplanning.	*/
-	let mut node = vec![];
-	let mut edge = vec![];
-	let mut adj: Vec<LinkedList<usize>> =Vec::with_capacity(n);
+	let mut node: Vec<Arc<Mutex<Node>>> = Vec::new();
+	let mut edge: Vec<Arc<Mutex<Edge>>> = Vec::new();
+	let mut adj: Vec<LinkedList<usize>> = Vec::with_capacity(n);
 	let excess: Arc<Mutex<VecDeque<usize>>> = Arc::new(Mutex::new(VecDeque::new()));
 	let debug = false;
 
@@ -170,18 +170,20 @@ fn main() {
     		s_lock.e += e.c;
 		}
 
-		push(&mut node[s].lock().unwrap(), &mut u, &mut e, &mut excess);
+		push(&mut node[s].lock().unwrap(), &mut u, &mut e, &excess);
 	}
 
-	thread::spawn()
+	let node_cl = Arc::new(node);
+	let edge_cl = Arc::new(edge);
+	let adj_cl = Arc::new(adj);
 
 	let num_workers = 8;
 	let mut handles = Vec::new();
 
 	for _ in 0..num_workers {
-		let node_cl = Arc::clone(&node);
-		let edge_cl = Arc::clone(&edge);
-		let adj_cl = Arc::clone(&adj);
+		let node_cl = Arc::clone(&node_cl);
+		let edge_cl = Arc::clone(&edge_cl);
+		let adj_cl = Arc::clone(&adj_cl);
 		let excess_cl = Arc::clone(&excess);
 
 		let handle = thread::spawn(move || {
@@ -194,7 +196,7 @@ fn main() {
 
 
 				if let Some(u) = u_opt {
-					discharge(u, &node_cl, &mut edge_cl.clone(), &mut adj_cl[u].clone(), &mut excess_cl.lock().unwrap());
+					discharge(u, &node_cl, &edge_cl, &adj_cl[u], &excess_cl);
 				} else {
 					break;
 				}
@@ -208,7 +210,7 @@ fn main() {
 		h.join().unwrap();
 	}
 
-	let sink_excess = node[n-1].lock().unwrap().e;
+	let sink_excess = node_cl[node_cl.len()-1].lock().unwrap().e;
 	println!("f = {}", sink_excess);
 
 }
