@@ -3,7 +3,6 @@
 use std::sync::{Mutex,Arc};
 use std::collections::LinkedList;
 use std::cmp;
-use std::thread;
 use std::collections::VecDeque;
 
 struct Node {
@@ -32,6 +31,78 @@ impl Edge {
         }
 }
 
+fn relabel(u:&mut Node, excess_list:&mut VecDeque<usize>) {
+	u.h += 1;
+	excess_list.push_back(u.i);
+}
+
+fn push(u:&mut Node, v:&mut Node, e:&mut Edge, excess_list:&mut VecDeque<usize>) {
+
+	let d = if u.i == e.u {
+		let d = cmp::min(u.e, e.c - e.f);
+		e.f += d;
+		d
+	} else {
+		let d = cmp::min(u.e, e.c + e.f);
+		e.f -= d;
+		d
+	};
+
+	println!("Push {} from {} to {}", d, u.i, v.i);
+
+	u.e -= d;
+	v.e += d;
+	
+	// The following are always true.
+    assert!(d >= 0);
+    assert!(u.e >= 0);
+    assert!(e.f.abs() <= e.c);
+
+	if u.e > 0 {
+		excess_list.push_back(u.i);
+	}
+
+	if v.e == d {
+		excess_list.push_back(v.i);
+	}
+}
+
+fn discharge(
+	u: usize, 
+	node: &Vec<Arc<Mutex<Node>>>, 
+	edge: &mut Vec<Arc<Mutex<Edge>>>, 
+	adj_edges: &mut LinkedList<usize>, 
+	excess: &mut VecDeque<usize>
+) {
+	let mut b: i32;
+
+	if u == 0 || u == node.len() - 1 {
+		return;
+	}
+
+	let mut from = node[u].lock().unwrap();
+
+	for &e in adj_edges.iter() {
+		let mut edge = edge[e].lock().unwrap();
+		let mut to;
+
+		if edge.u == u {
+			to = node[edge.v].lock().unwrap();
+			b = 1;
+		} else {
+			to = node[edge.u].lock().unwrap();
+			b = -1;
+		}
+
+		if from.h > to.h && b * edge.f < edge.c {
+			push(&mut from, &mut to, &mut edge, excess);
+			return;
+		}
+	}
+
+	relabel(&mut from, excess);
+}
+
 
 fn main() {
 
@@ -46,7 +117,7 @@ fn main() {
 	let debug = false;
 
 	let s = 0;
-	let t = n-1;
+	let _t = n-1;
 
 	println!("n = {}", n);
 	println!("m = {}", m);
@@ -80,15 +151,34 @@ fn main() {
 	}
 
 	println!("initial pushes");
-	let iter = adj[s].iter();
 
-	// but nothing is done here yet...
+	// Initialize source height to n
+	node[s].lock().unwrap().h = n as i32;
 
-	while !excess.is_empty() {
-		let mut c = 0;
-		let u = excess.pop_front().unwrap();
+	// do initial pushes
+	for &e in adj[s].iter() {
+		let mut e = edge[e].lock().unwrap();
+		let mut u = if e.u == s {
+			node[e.v].lock().unwrap()
+		} else {
+			node[e.u].lock().unwrap()
+		};
+
+		{
+    		let mut s_lock = node[s].lock().unwrap();
+    		s_lock.e += e.c;
+		}
+
+		push(&mut node[s].lock().unwrap(), &mut u, &mut e, &mut excess);
+		drop(u);
 	}
 
-	println!("f = {}", 0);
+	while !excess.is_empty() {
+		let u = excess.pop_front().unwrap();
+		discharge(u, &mut node, &mut edge, &mut adj[u], &mut excess)
+	}
+
+	let sink_excess = node[n-1].lock().unwrap().e;
+	println!("f = {}", sink_excess);
 
 }
