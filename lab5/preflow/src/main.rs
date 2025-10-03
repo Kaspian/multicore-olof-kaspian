@@ -3,6 +3,7 @@
 use std::sync::{Mutex,Arc};
 use std::collections::LinkedList;
 use std::cmp;
+use std::thread;
 use std::collections::VecDeque;
 
 struct Node {
@@ -31,12 +32,12 @@ impl Edge {
         }
 }
 
-fn relabel(u:&mut Node, excess_list:&mut VecDeque<usize>) {
+fn relabel(u:&mut Node, excess_list:&mut Arc<Mutex<VecDeque<usize>>>) {
 	u.h += 1;
 	excess_list.push_back(u.i);
 }
 
-fn push(u:&mut Node, v:&mut Node, e:&mut Edge, excess_list:&mut VecDeque<usize>) {
+fn push(u:&mut Node, v:&mut Node, e:&mut Edge, excess_list:&mut Arc<Mutex<VecDeque<usize>>>) {
 
 	let d = if u.i == e.u {
 		let d = cmp::min(u.e, e.c - e.f);
@@ -72,7 +73,7 @@ fn discharge(
 	node: &Vec<Arc<Mutex<Node>>>, 
 	edge: &mut Vec<Arc<Mutex<Edge>>>, 
 	adj_edges: &mut LinkedList<usize>, 
-	excess: &mut VecDeque<usize>
+	excess: &mut Arc<Mutex<VecDeque<usize>>>
 ) {
 	let mut b: i32;
 
@@ -113,7 +114,7 @@ fn main() {
 	let mut node = vec![];
 	let mut edge = vec![];
 	let mut adj: Vec<LinkedList<usize>> =Vec::with_capacity(n);
-	let mut excess: VecDeque<usize> = VecDeque::new();
+	let excess: Arc<Mutex<VecDeque<usize>>> = Arc::new(Mutex::new(VecDeque::new()));
 	let debug = false;
 
 	let s = 0;
@@ -172,9 +173,39 @@ fn main() {
 		push(&mut node[s].lock().unwrap(), &mut u, &mut e, &mut excess);
 	}
 
-	while !excess.is_empty() {
-		let u = excess.pop_front().unwrap();
-		discharge(u, &mut node, &mut edge, &mut adj[u], &mut excess)
+	thread::spawn()
+
+	let num_workers = 8;
+	let mut handles = Vec::new();
+
+	for _ in 0..num_workers {
+		let node_cl = Arc::clone(&node);
+		let edge_cl = Arc::clone(&edge);
+		let adj_cl = Arc::clone(&adj);
+		let excess_cl = Arc::clone(&excess);
+
+		let handle = thread::spawn(move || {
+			loop {
+				let u_opt = {
+					let mut q = excess_cl.lock().unwrap();
+					q.pop_front()
+					
+				};
+
+
+				if let Some(u) = u_opt {
+					discharge(u, &node_cl, &mut edge_cl.clone(), &mut adj_cl[u].clone(), &mut excess_cl.lock().unwrap());
+				} else {
+					break;
+				}
+			}
+		});
+	handles.push(handle);
+	}
+
+	// join workers
+	for h in handles {
+		h.join().unwrap();
 	}
 
 	let sink_excess = node[n-1].lock().unwrap().e;
