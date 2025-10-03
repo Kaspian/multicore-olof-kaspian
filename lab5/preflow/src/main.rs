@@ -170,7 +170,6 @@ fn main() {
 		}
 
 		push(&mut node[s].lock().unwrap(), &mut u, &mut e, &mut excess);
-		drop(u);
 	}
 
 	while !excess.is_empty() {
