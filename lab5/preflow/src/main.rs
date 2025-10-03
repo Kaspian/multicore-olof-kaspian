@@ -1,216 +1,276 @@
-#[macro_use] extern crate text_io;
+#[macro_use]
+extern crate text_io;
 
-use std::sync::{Mutex,Arc};
-use std::collections::LinkedList;
 use std::cmp;
+use std::collections::{LinkedList, VecDeque};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::collections::VecDeque;
 
 struct Node {
-	i:	usize,			/* index of itself for debugging.	*/
-	e:	i32,			/* excess preflow.			*/
-	h:	i32,			/* height.				*/
+    i: usize, // index (for debugging)
+    e: i32,   // excess preflow
+    h: i32,   // height
 }
 
 struct Edge {
-        u:      usize,  
-        v:      usize,
-        f:      i32,
-        c:      i32,
+    u: usize,
+    v: usize,
+    f: i32,
+    c: i32,
 }
 
 impl Node {
-	fn new(ii:usize) -> Node {
-		Node { i: ii, e: 0, h: 0 }
-	}
-
+    fn new(ii: usize) -> Node {
+        Node { i: ii, e: 0, h: 0 }
+    }
 }
 
 impl Edge {
-        fn new(uu:usize, vv:usize,cc:i32) -> Edge {
-                Edge { u: uu, v: vv, f: 0, c: cc }      
+    fn new(uu: usize, vv: usize, cc: i32) -> Edge {
+        Edge { u: uu, v: vv, f: 0, c: cc }
+    }
+}
+
+
+struct WorkState {
+    queue: VecDeque<usize>,
+    active: usize,   // workers currently processing a node
+    shutdown: bool,  // signal workers to exit
+}
+
+struct WorkQueue {
+    state: Mutex<WorkState>,
+    cv: Condvar,
+}
+
+impl WorkQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WorkState {
+                queue: VecDeque::new(),
+                active: 0,
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
         }
+    }
+
+    fn enqueue(&self, u: usize) {
+        let mut st = self.state.lock().unwrap();
+        st.queue.push_back(u);
+        self.cv.notify_one();
+    }
+
+    fn dequeue(&self) -> Option<usize> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if st.shutdown {
+                return None;
+            }
+            if let Some(u) = st.queue.pop_front() {
+                st.active += 1;
+                return Some(u);
+            }
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    fn done_one(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.active -= 1;
+        if st.active == 0 && st.queue.is_empty() {
+            // wake the waiter in main when drained
+            self.cv.notify_all();
+        }
+    }
+
+    fn wait_for_drain(&self) {
+        let mut st = self.state.lock().unwrap();
+        while !(st.active == 0 && st.queue.is_empty()) {
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    fn shutdown(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.shutdown = true;
+        self.cv.notify_all();
+    }
 }
 
-fn relabel(u:&mut Node, excess_list:&Arc<Mutex<VecDeque<usize>>>) {
-	u.h += 1;
-	excess_list.lock().unwrap().push_back(u.i);
+fn relabel(u: &mut Node, work: &Arc<WorkQueue>) {
+    u.h += 1;
+    work.enqueue(u.i);
 }
 
-fn push(u:&mut Node, v:&mut Node, e:&mut Edge, excess_list:&Arc<Mutex<VecDeque<usize>>>) {
+fn push(u: &mut Node, v: &mut Node, e: &mut Edge, work: &Arc<WorkQueue>) {
+    let d = if u.i == e.u {
+        let d = cmp::min(u.e, e.c - e.f);
+        e.f += d;
+        d
+    } else {
+        let d = cmp::min(u.e, e.c + e.f);
+        e.f -= d;
+        d
+    };
 
-	let d = if u.i == e.u {
-		let d = cmp::min(u.e, e.c - e.f);
-		e.f += d;
-		d
-	} else {
-		let d = cmp::min(u.e, e.c + e.f);
-		e.f -= d;
-		d
-	};
+    println!("Push {} from {} to {}", d, u.i, v.i);
 
-	println!("Push {} from {} to {}", d, u.i, v.i);
+    u.e -= d;
+    v.e += d;
 
-	u.e -= d;
-	v.e += d;
-	
-	// The following are always true.
     assert!(d >= 0);
     assert!(u.e >= 0);
     assert!(e.f.abs() <= e.c);
 
-	if u.e > 0 {
-		excess_list.lock().unwrap().push_back(u.i);
-	}
-
-	if v.e == d {
-		excess_list.lock().unwrap().push_back(v.i);
-	}
+    if u.e > 0 {
+        work.enqueue(u.i);
+    }
+    if v.e == d {
+        work.enqueue(v.i);
+    }
 }
 
+/// discharge one node `u`.
+/// for simplicity & safety we take a global graph lock
+/// so we never deadlock on (u, v, edge) mutexes.
 fn discharge(
-	u: usize, 
-	node: &Vec<Arc<Mutex<Node>>>, 
-	edge: &Vec<Arc<Mutex<Edge>>>, 
-	adj_edges: &LinkedList<usize>, 
-	excess: &Arc<Mutex<VecDeque<usize>>>
+    u: usize,
+    node: &Arc<Vec<Arc<Mutex<Node>>>>,
+    edge: &Arc<Vec<Arc<Mutex<Edge>>>>,
+    adj_edges: &LinkedList<usize>,
+    work: &Arc<WorkQueue>,
+    graph_lock: &Arc<Mutex<()>>,
 ) {
-	let mut b: i32;
+    let _g = graph_lock.lock().unwrap(); // global lock
 
-	if u == 0 || u == node.len() - 1 {
-		return;
-	}
+    if u == 0 || u == node.len() - 1 {
+        return;
+    }
 
-	let mut from = node[u].lock().unwrap();
+    let mut from = node[u].lock().unwrap();
 
-	for &e in adj_edges.iter() {
-		let mut edge = edge[e].lock().unwrap();
-		let mut to;
+    // try edge and push once
+    for &ei in adj_edges.iter() {
+        let mut e_guard = edge[ei].lock().unwrap();
 
-		if edge.u == u {
-			to = node[edge.v].lock().unwrap();
-			b = 1;
-		} else {
-			to = node[edge.u].lock().unwrap();
-			b = -1;
-		}
+        // determin neighbor and direction
+        let (v_idx, b): (usize, i32) = if e_guard.u == u {
+            (e_guard.v, 1)
+        } else {
+            (e_guard.u, -1)
+        };
 
-		if from.h > to.h && b * edge.f < edge.c {
-			push(&mut from, &mut to, &mut edge, excess);
-			return;
-		}
-	}
+        let mut to = node[v_idx].lock().unwrap();
 
-	relabel(&mut from, excess);
+        if from.h > to.h && b * e_guard.f < e_guard.c {
+            push(&mut from, &mut to, &mut e_guard, work);
+            return;
+        }
+    }
+
+    // no push possible -> relabel
+    relabel(&mut from, work);
 }
 
 
 fn main() {
+    let n: usize = read!();
+    let m: usize = read!();
+    let _c: usize = read!();
+    let _p: usize = read!();
 
-	let n: usize = read!();		/* n nodes.						*/
-	let m: usize = read!();		/* m edges.						*/
-	let _c: usize = read!();	/* underscore avoids warning about an unused variable.	*/
-	let _p: usize = read!();	/* c and p are in the input from 6railwayplanning.	*/
-	let mut node: Vec<Arc<Mutex<Node>>> = Vec::new();
-	let mut edge: Vec<Arc<Mutex<Edge>>> = Vec::new();
-	let mut adj: Vec<LinkedList<usize>> = Vec::with_capacity(n);
-	let excess: Arc<Mutex<VecDeque<usize>>> = Arc::new(Mutex::new(VecDeque::new()));
-	let debug = false;
+    println!("n = {}", n);
+    println!("m = {}", m);
 
-	let s = 0;
-	let _t = n-1;
+    let mut node_vec = Vec::with_capacity(n);
+    let mut edge_vec = Vec::with_capacity(m);
+    let mut adj: Vec<LinkedList<usize>> = Vec::with_capacity(n);
 
-	println!("n = {}", n);
-	println!("m = {}", m);
+    for i in 0..n {
+        node_vec.push(Arc::new(Mutex::new(Node::new(i))));
+        adj.push(LinkedList::new());
+    }
 
-	for i in 0..n {
-		let u:Node = Node::new(i);
-		node.push(Arc::new(Mutex::new(u))); 
-		adj.push(LinkedList::new());
-	}
+    for i in 0..m {
+        let u: usize = read!();
+        let v: usize = read!();
+        let c: i32 = read!();
+        edge_vec.push(Arc::new(Mutex::new(Edge::new(u, v, c))));
+        adj[u].push_back(i);
+        adj[v].push_back(i);
+    }
 
-	for i in 0..m {
-		let u: usize = read!();
-		let v: usize = read!();
-		let c: i32 = read!();
-		let e:Edge = Edge::new(u,v,c);
-		adj[u].push_back(i);
-		adj[v].push_back(i);
-		edge.push(Arc::new(Mutex::new(e))); 
-	}
+    let node = Arc::new(node_vec);
+    let edge = Arc::new(edge_vec);
+    let adj = Arc::new(adj);
 
-	if debug {
-		for i in 0..n {
-			print!("adj[{}] = ", i);
-			let iter = adj[i].iter();
+    let s = 0usize;
+    let t = n - 1;
 
-			for e in iter {
-				print!("e = {}, ", e);
-			}
-			println!("");
-		}
-	}
+    // shared work queue and global graph lock
+    let work = Arc::new(WorkQueue::new());
+    let graph_lock = Arc::new(Mutex::new(()));
 
-	println!("initial pushes");
+    println!("initial pushes");
 
-	// Initialize source height to n
-	node[s].lock().unwrap().h = n as i32;
+    // init source height to n and do initial pushes
+    {
+        let _g = graph_lock.lock().unwrap();
 
-	// do initial pushes
-	for &e in adj[s].iter() {
-		let mut e = edge[e].lock().unwrap();
-		let mut u = if e.u == s {
-			node[e.v].lock().unwrap()
-		} else {
-			node[e.u].lock().unwrap()
-		};
+        node[s].lock().unwrap().h = n as i32;
 
-		{
-    		let mut s_lock = node[s].lock().unwrap();
-    		s_lock.e += e.c;
-		}
+        // initial pushes along all edges from s
+        for &ei in &adj[s] {
+            let mut e_guard = edge[ei].lock().unwrap();
 
-		push(&mut node[s].lock().unwrap(), &mut u, &mut e, &excess);
-	}
+            let nbr = if e_guard.u == s {
+                e_guard.v
+            } else {
+                e_guard.u
+            };
 
-	let node_cl = Arc::new(node);
-	let edge_cl = Arc::new(edge);
-	let adj_cl = Arc::new(adj);
+            {
+                let mut s_lock = node[s].lock().unwrap();
+                s_lock.e += e_guard.c;
+            }
 
-	let num_workers = 8;
-	let mut handles = Vec::new();
+            let mut s_lock = node[s].lock().unwrap();
+            let mut u_lock = node[nbr].lock().unwrap();
+            push(&mut s_lock, &mut u_lock, &mut e_guard, &work);
+        }
+    }
 
-	for _ in 0..num_workers {
-		let node_cl = Arc::clone(&node_cl);
-		let edge_cl = Arc::clone(&edge_cl);
-		let adj_cl = Arc::clone(&adj_cl);
-		let excess_cl = Arc::clone(&excess);
+    // spawn workers
+    let threads = 8;
 
-		let handle = thread::spawn(move || {
-			loop {
-				let u_opt = {
-					let mut q = excess_cl.lock().unwrap();
-					q.pop_front()
-					
-				};
+    let mut handles = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let node_cl = Arc::clone(&node);
+        let edge_cl = Arc::clone(&edge);
+        let adj_cl = Arc::clone(&adj);
+        let work_cl = Arc::clone(&work);
+        let gl_cl = Arc::clone(&graph_lock);
 
+        let h = thread::spawn(move || {
+            while let Some(u) = work_cl.dequeue() {
+                // process one node
+                discharge(u, &node_cl, &edge_cl, &adj_cl[u], &work_cl, &gl_cl);
+                work_cl.done_one();
+            }
+            // thread exits on shutdown
+        });
+        handles.push(h);
+    }
 
-				if let Some(u) = u_opt {
-					discharge(u, &node_cl, &edge_cl, &adj_cl[u], &excess_cl);
-				} else {
-					break;
-				}
-			}
-		});
-	handles.push(handle);
-	}
+    // wait until the work queue drains (no active workers queue empty)
+    work.wait_for_drain();
+    // tell workers to exit and join them
+    work.shutdown();
+    for h in handles {
+        let _ = h.join();
+    }
 
-	// join workers
-	for h in handles {
-		h.join().unwrap();
-	}
-
-	let sink_excess = node_cl[node_cl.len()-1].lock().unwrap().e;
-	println!("f = {}", sink_excess);
-
+    let sink_excess = node[t].lock().unwrap().e;
+    println!("f = {}", sink_excess);
 }
