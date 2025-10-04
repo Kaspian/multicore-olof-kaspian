@@ -3,31 +3,31 @@ extern crate text_io;
 
 use std::cmp;
 use std::collections::{LinkedList, VecDeque};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex}; use std::thread;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 struct Node {
     i: usize, // index (for debugging)
-    e: i32,   // excess preflow
-    h: i32,   // height
+    e: AtomicI32,
+    h: AtomicI32,
 }
 
 struct Edge {
     u: usize,
     v: usize,
-    f: i32,
+    f: AtomicI32,
     c: i32,
 }
 
 impl Node {
     fn new(ii: usize) -> Node {
-        Node { i: ii, e: 0, h: 0 }
+        Node { i: ii, e: AtomicI32::new(0), h: AtomicI32::new(0) }
     }
 }
 
 impl Edge {
     fn new(uu: usize, vv: usize, cc: i32) -> Edge {
-        Edge { u: uu, v: vv, f: 0, c: cc }
+        Edge { u: uu, v: vv, f: AtomicI32::new(0), c: cc }
     }
 }
 
@@ -61,28 +61,58 @@ impl WorkQueue {
         self.cv.notify_one();
     }
 
-    fn dequeue(&self) -> Option<usize> {
+    // fn dequeue(&self) -> Option<usize> {
+    //     let mut st = self.state.lock().unwrap();
+    //     loop {
+    //         if st.shutdown {
+    //             return None;
+    //         }
+    //         if let Some(u) = st.queue.pop_front() {
+    //             st.active += 1;
+    //             return Some(u);
+    //         }
+    //         st = self.cv.wait(st).unwrap();
+    //     }
+    // }
+
+    fn dequeue_batch(&self, n: usize) -> Option<Vec<usize>> {
         let mut st = self.state.lock().unwrap();
         loop {
             if st.shutdown {
                 return None;
             }
-            if let Some(u) = st.queue.pop_front() {
-                st.active += 1;
-                return Some(u);
+            if !st.queue.is_empty() {
+                let mut batch = Vec::with_capacity(n);
+                for _ in 0..n {
+                    if let Some(u) = st.queue.pop_front() {
+                        st.active += 1;
+                        batch.push(u);
+                    } else {
+                        break;
+                    }
+                }
+                return Some(batch);
             }
             st = self.cv.wait(st).unwrap();
         }
     }
 
-    fn done_one(&self) {
+    fn done_batch(&self, k: usize) {
         let mut st = self.state.lock().unwrap();
-        st.active -= 1;
+        st.active -= k;
         if st.active == 0 && st.queue.is_empty() {
-            // wake the waiter in main when drained
             self.cv.notify_all();
         }
     }
+
+    // fn done_one(&self) {
+    //     let mut st = self.state.lock().unwrap();
+    //     st.active -= 1;
+    //     if st.active == 0 && st.queue.is_empty() {
+    //         // wake the waiter in main when drained
+    //         self.cv.notify_all();
+    //     }
+    // }
 
     fn wait_for_drain(&self) {
         let mut st = self.state.lock().unwrap();
@@ -99,34 +129,48 @@ impl WorkQueue {
 }
 
 fn relabel(u: &mut Node, work: &Arc<WorkQueue>) {
-    u.h += 1;
+    let new_h = u.h.load(Ordering::SeqCst) + 1;
+    u.h.store(new_h, Ordering::SeqCst);
+    //u.h += 1;
     work.enqueue(u.i);
 }
 
 fn push(u: &mut Node, v: &mut Node, e: &mut Edge, work: &Arc<WorkQueue>) {
-    let d = if u.i == e.u {
-        let d = cmp::min(u.e, e.c - e.f);
-        e.f += d;
-        d
+    let dir = if u.i == e.u { 1 } else { -1 };
+    let u_excess = u.e.load(Ordering::SeqCst);
+    if u_excess <= 0 { return; }
+
+    let f_val = e.f.load(Ordering::SeqCst);
+    
+    let delta = if dir == 1 {
+        e.c - f_val
     } else {
-        let d = cmp::min(u.e, e.c + e.f);
-        e.f -= d;
-        d
+        e.c + f_val
     };
+
+    let d = cmp::min(u_excess, delta);
+    if d <= 0 {
+        return;
+    }
+
+    if dir == 1 {
+        e.f.fetch_add(delta, Ordering::SeqCst);
+    } else {
+        e.f.fetch_sub(delta, Ordering::SeqCst);
+    }
 
     println!("Push {} from {} to {}", d, u.i, v.i);
 
-    u.e -= d;
-    v.e += d;
+    let new_f = if dir == 1 { f_val + d } else { f_val - d };
+    e.f.store(new_f, Ordering::SeqCst);
 
-    assert!(d >= 0);
-    assert!(u.e >= 0);
-    assert!(e.f.abs() <= e.c);
+    let prev_u = u.e.fetch_sub(d, Ordering::SeqCst); // returns old value
+    let prev_v = v.e.fetch_add(d, Ordering::SeqCst); // returns old value
 
-    if u.e > 0 {
+    if prev_u > d {
         work.enqueue(u.i);
     }
-    if v.e == d {
+    if prev_v == 0 {
         work.enqueue(v.i);
     }
 }
@@ -142,11 +186,11 @@ fn discharge(
     work: &Arc<WorkQueue>,
     graph_lock: &Arc<Mutex<()>>,
 ) {
-    let _g = graph_lock.lock().unwrap(); // global lock
-
     if u == 0 || u == node.len() - 1 {
         return;
     }
+
+    let _g = graph_lock.lock().unwrap(); // global lock
 
     let mut from = node[u].lock().unwrap();
 
@@ -161,9 +205,13 @@ fn discharge(
             (e_guard.u, -1)
         };
 
-        let mut to = node[v_idx].lock().unwrap();
+        let fv = e_guard.f.load(Ordering::SeqCst);
+        let residual = if b == 1 { e_guard.c - fv } else { e_guard.c + fv };
+        let fh = from.h.load(Ordering::SeqCst);
+        let th = node[v_idx].lock().unwrap().h.load(Ordering::SeqCst);
 
-        if from.h > to.h && b * e_guard.f < e_guard.c {
+        if fh == th + 1 && residual > 0 {
+            let mut to = node[v_idx].lock().unwrap();
             push(&mut from, &mut to, &mut e_guard, work);
             return;
         }
@@ -205,7 +253,7 @@ fn main() {
     let edge = Arc::new(edge_vec);
     let adj = Arc::new(adj);
 
-    let s = 0usize;
+    let s = 0;
     let t = n - 1;
 
     // shared work queue and global graph lock
@@ -218,7 +266,7 @@ fn main() {
     {
         let _g = graph_lock.lock().unwrap();
 
-        node[s].lock().unwrap().h = n as i32;
+        node[s].lock().unwrap().h.store(n as i32, Ordering::SeqCst);
 
         // initial pushes along all edges from s
         for &ei in &adj[s] {
@@ -231,8 +279,9 @@ fn main() {
             };
 
             {
-                let mut s_lock = node[s].lock().unwrap();
-                s_lock.e += e_guard.c;
+                let s_lock = node[s].lock().unwrap();
+                s_lock.e.fetch_add(e_guard.c, Ordering::SeqCst);
+                //s_lock.e += e_guard.c;
             }
 
             let mut s_lock = node[s].lock().unwrap();
@@ -253,10 +302,13 @@ fn main() {
         let gl_cl = Arc::clone(&graph_lock);
 
         let h = thread::spawn(move || {
-            while let Some(u) = work_cl.dequeue() {
-                // process one node
-                discharge(u, &node_cl, &edge_cl, &adj_cl[u], &work_cl, &gl_cl);
-                work_cl.done_one();
+            let batch_size = 10;
+            while let Some(batch) = work_cl.dequeue_batch(batch_size) {
+                // handle batch of nodes
+                for &u in &batch {
+                    discharge(u, &node_cl, &edge_cl, &adj_cl[u], &work_cl, &gl_cl);
+                }
+                work_cl.done_batch(batch.len());
             }
             // thread exits on shutdown
         });
@@ -271,6 +323,6 @@ fn main() {
         let _ = h.join();
     }
 
-    let sink_excess = node[t].lock().unwrap().e;
-    println!("f = {}", sink_excess);
+    let sink_excess = &node[t].lock().unwrap().e;
+    println!("f = {}", sink_excess.load(Ordering::SeqCst));
 }
