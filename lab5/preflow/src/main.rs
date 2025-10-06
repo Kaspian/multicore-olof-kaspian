@@ -153,11 +153,11 @@ fn push(u: &mut Node, v: &mut Node, e: &mut Edge, work: &Arc<WorkQueue>) {
         return;
     }
 
-    if dir == 1 {
-        e.f.fetch_add(delta, Ordering::SeqCst);
-    } else {
-        e.f.fetch_sub(delta, Ordering::SeqCst);
-    }
+    // if dir == 1 {
+    //     e.f.fetch_add(delta, Ordering::SeqCst);
+    // } else {
+    //     e.f.fetch_sub(delta, Ordering::SeqCst);
+    // }
 
     println!("Push {} from {} to {}", d, u.i, v.i);
 
