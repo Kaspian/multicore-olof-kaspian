@@ -1,4 +1,4 @@
-require '[clojure.string :as str])		; for splitting an input line into words
+(require '[clojure.string :as str])        ; for splitting an input line into words
 
 (def debug false)
 
@@ -43,6 +43,14 @@ require '[clojure.string :as str])		; for splitting an input line into words
 (defn u-is-edge-u [edge u]
 	(= (:u edge) u))
 
+(defn residual [edges i u]
+  (let [e @(edges i)
+        f (edge-flow e)
+        c (edge-capacity e)]
+    (if (u-is-edge-u e u)
+      (- c f)     ; capacity left in the stored direction
+      (+ c f))))  ; capacity left in the reverse direction
+
 (defn increase-flow [edges i d]
 	(ref-set (edges i) (update @(edges i) :f + d)))
 
@@ -60,39 +68,78 @@ require '[clojure.string :as str])		; for splitting an input line into words
 	(if (and (not= v s) (not= v t))
 		(insert excess-nodes v)))
 
+;; performs a push from u over edge edge-index, if possible
 (defn push [edge-index u nodes edges excess-nodes change s t]
-	(let [v 	(other @(edges edge-index) u)]
-	(let [uh	(node-height @(nodes u))]
-	(let [vh	(node-height @(nodes v))]
-	(let [e 	(node-excess @(nodes u))]
-	(let [i		edge-index]
-	(let [f 	(edge-flow @(edges i))]
-	(let [c 	(edge-capacity @(edges i))]
-
-	(if debug
-		(do
-			(println "--------- push -------------------")
-			(println "i = " i)
-			(println "u = " u)
-			(println "uh = " uh)
-			(println "e = " e)
-			(println "f = " f)
-			(println "c = " c)
-			(println "v = " v)
-			(println "vh = " vh)))))))))))
+  (let [edge @(edges edge-index)
+        v    (other edge u)
+        uh   (node-height @(nodes u))
+        vh   (node-height @(nodes v))
+        e    (node-excess @(nodes u))
+        res  (residual edges edge-index u)]
+    (when (and (> e 0) (> res 0) (> uh vh))
+      (let [d (min e res)]
+        (if (u-is-edge-u edge u)
+          (increase-flow edges edge-index d)
+          (decrease-flow edges edge-index d))
+        (move-excess nodes u v d)
+        (check-insert excess-nodes v s t)
+        (when change
+          (ref-set change d))))))
 
 
 ; go through adjacency-list of source and push
 (defn initial-push [adj s t nodes edges excess-nodes]
-	(let [change (ref 0)] ; unused for initial pushes since we know they will be performed
-	(if (not (empty? adj))
-		(do 
-			; give source this capacity as excess so the push will be accepted
-			(push (first adj) s nodes edges excess-nodes change s t)
-			(initial-push (rest adj) s t nodes edges excess-nodes)))))
+  (let [change (ref 0)] ; unused for initial pushes since we know they will be performed
+    (if (not (empty? adj))
+      (do
+        (let [i   (first adj)
+              res (residual edges i s)]
+          (ref-set (nodes s) (update @(nodes s) :e + res))
+          (push i s nodes edges excess-nodes change s t))
+        (initial-push (rest adj) s t nodes edges excess-nodes)))))
 
 (defn initial-pushes [nodes edges s t excess-nodes]
 	(initial-push (node-adj @(nodes s)) s t nodes edges excess-nodes))
+
+(defn relabel [u nodes edges]
+  (let [adj (node-adj @(nodes u))]
+    (let [minh (loop [lst adj, mh nil]
+                 (if (empty? lst)
+                   mh
+                   (let [i    (first lst)
+                         edge @(edges i)
+                         res  (residual edges i u)]
+                     (if (> res 0)
+                       (let [v  (other edge u)
+                             vh (node-height @(nodes v))
+                             nm (if (nil? mh) vh (min mh vh))]
+                         (recur (rest lst) nm))
+                       (recur (rest lst) mh)))))]
+      (when (some? minh)
+        (let [target (inc minh)
+              curr   (node-height @(nodes u))
+              delta  (- target curr)]
+          (ref-set (nodes u) (update @(nodes u) :h + delta)))))))
+
+(defn push-any [u nodes edges excess-nodes s t]
+  (let [adj (node-adj @(nodes u))]
+    (loop [lst adj]
+      (if (empty? lst)
+        false
+        (let [i      (first lst)
+              change (ref 0)]
+          (push i u nodes edges excess-nodes change s t)
+          (if (> @change 0)
+            true
+            (recur (rest lst))))))))
+
+(defn discharge [u nodes edges excess-nodes s t]
+  (loop []
+    (when (and (> (node-excess @(nodes u)) 0) (not= u s) (not= u t))
+      (dosync
+        (when (not (push-any u nodes edges excess-nodes s t))
+          (relabel u nodes edges)))
+      (recur))))
 
 (defn remove-any [excess-nodes]
 	(dosync 
@@ -125,9 +172,12 @@ require '[clojure.string :as str])		; for splitting an input line into words
 (dosync (read-graph 0 m nodes edges))
 
 (defn preflow []
-
-	(dosync (initial-pushes nodes edges s t excess-nodes))
-
-	(println "f =" (node-excess @(nodes t))))
+  (dosync
+    (initial-pushes nodes edges s t excess-nodes))
+  (loop [u (remove-any excess-nodes)]
+    (when (>= u 0)
+      (discharge u nodes edges excess-nodes s t)
+      (recur (remove-any excess-nodes))))
+  (println "f =" (node-excess @(nodes t))))
 
 (preflow)
