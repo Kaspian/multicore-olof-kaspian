@@ -2,6 +2,8 @@
 
 (def debug false)
 
+(def num-threads 4) ; number of threads
+
 (defn prepend [list value] (cons value list))	; put value at the front of list
 
 (defrecord node [i e h adj])			; index excess-preflow height adjacency-list
@@ -171,7 +173,7 @@
 
 (dosync (read-graph 0 m nodes edges))
 
-(defn preflow []
+(defn preflow-seq []
   (dosync
     (initial-pushes nodes edges s t excess-nodes))
   (loop [u (remove-any excess-nodes)]
@@ -179,5 +181,47 @@
       (discharge u nodes edges excess-nodes s t)
       (recur (remove-any excess-nodes))))
   (println "f =" (node-excess @(nodes t))))
+
+(defn any-active? []
+  ;; returns true if any node expect sink or source has positive excess
+  (dosync
+    (boolean
+      (some true?
+            (for [i (range n)
+                  :when (and (not= i s) (not= i t))]
+              (> (node-excess @(nodes i)) 0))))))
+              
+(defn worker []
+  ;; worker thread, repeatedly take an active node and discharge it
+  (loop []
+    (let [u (remove-any excess-nodes)]
+      (cond
+        (>= u 0)
+        (do
+          (discharge u nodes edges excess-nodes s t)
+          (recur))
+
+        ;; No readily available active node; if others might still make progress,
+        ;; spin-wait briefly by looping (STM keeps this safe).
+        (any-active?)
+        (recur)
+
+        :else
+        nil))))  ; queue empty and no active nodes left -> exit
+
+(defn preflow-par []
+  (dosync
+    (initial-pushes nodes edges s t excess-nodes))
+  (let [threads (doall (repeatedly num-threads #(Thread. worker)))]
+    (run! #(.start %) threads)
+    (run! #(.join %) threads))
+  (println "f =" (node-excess @(nodes t))))
+
+
+(defn preflow []
+  (if (= num-threads 1)
+    (preflow-seq)
+    (preflow-par)))
+
 
 (preflow)
