@@ -9,6 +9,8 @@
 #include <limits.h>
 
 #define PRINT 0
+#define TC 8
+#define BATCH_SIZE 12
 #define MIN(a, b)(((a) <= (b)) ? (a) : (b))
 #define MAX(a, b)(((a) >= (b)) ? (a) : (b))
 
@@ -18,6 +20,7 @@ typedef struct graph_t graph_t;
 typedef struct node_t node_t;
 typedef struct edge_t edge_t;
 typedef struct preflow_context_t preflow_context_t;
+typedef struct xedge_t xedge_t;
 typedef struct thread_ctx_t thread_ctx_t;
 
 static char * progname;
@@ -28,6 +31,12 @@ static char * progname;
 #define pr(...)
 #endif
 
+struct xedge_t {
+	int		u;	/* one of the two nodes.	*/
+	int		v;	/* the other. 			*/
+	int		c;	/* capacity.			*/
+};
+
 struct node_t {
   int h;
   int e;
@@ -35,6 +44,7 @@ struct node_t {
   int start;
   int degree;
   int is_in_queue;
+  char pad[64 - 6 * sizeof(int)]; /* pad to cache line size */
 };
 
 struct edge_t {
@@ -68,6 +78,9 @@ struct graph_t {
   int done;
   int active_workers;
   int work_counter;
+  int need_global_relabel;
+  int global_relabel_freq;
+  int work_done;
 };
 
 struct preflow_context_t {
@@ -164,7 +177,7 @@ static void enter_excess_locked(graph_t * g, node_t * v) {
       g -> queue_head = 0;
       g -> queue_tail = i;
       g -> queue_size = new_size;
-      next_tail = (g -> queue_tail + 1) % g -> queue_size;
+      next_tail = (g->queue_tail + 1) & (g->queue_size - 1);      
       pr("Queue resized to %d\n", new_size);
     }
     g -> active_queue[g -> queue_tail] = vid;
@@ -363,7 +376,7 @@ static void _build_update_queue(thread_ctx_t * ctx, node_t * u) {
 
 static int grab_excess_batch(graph_t * g, node_t ** local_queue, int max_nodes) {
   int count = 0;
-  pthread_mutex_lock( & g -> g_lock);
+  pthread_mutex_lock(& g -> g_lock);
   while (count < max_nodes && (g -> queue_head != g -> queue_tail)) {
     int vid = g -> active_queue[g -> queue_head];
     g -> queue_head = (g -> queue_head + 1) % g -> queue_size;
@@ -373,11 +386,144 @@ static int grab_excess_batch(graph_t * g, node_t ** local_queue, int max_nodes) 
     local_queue[count++] = v;
     g -> work_counter--;
   }
-  pthread_mutex_unlock( & g -> g_lock);
+  pthread_mutex_unlock(&g -> g_lock);
   return count;
 }
 
+static void global_relabel(graph_t *g)
+{
+    int n = g->n;
+    int *queue = xmalloc(n * sizeof(int));
+    int qhead = 0, qtail = 0;
+
+    for (int i = 0; i < n; ++i) {
+        g->nodes[i].h = INT_MAX;
+    }
+
+    int sink = g->sink;
+    g->nodes[sink].h = 0;
+    queue[qtail++] = sink;
+
+    while (qhead < qtail) {
+        int v = queue[qhead++];
+        int hv = g->nodes[v].h;
+
+        int start = g->nodes[v].start;
+        int degree = g->nodes[v].degree;
+
+        for (int k = 0; k < degree; ++k) {
+            int eid = g->adj[start + k];
+
+            int eu = g->edge_u[eid];
+            int ev = g->edge_v[eid];
+            int ec = g->edge_c[eid];
+            int ef = g->edge_f[eid];
+
+            int is_rev = (v == eu);           /* edge stored as v<-u? */
+            int u = is_rev ? ev : eu;
+
+            int residual = is_rev ? (ec - ef) : (ec + ef);
+
+            if (residual > 0 && g->nodes[u].h == INT_MAX) {
+                g->nodes[u].h = hv + 1;
+                queue[qtail++] = u;
+            }
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        if (g->nodes[i].h == INT_MAX)
+            g->nodes[i].h = n;   /* standard large value */
+        g->nodes[i].cur = 0;
+    }
+
+    free(queue);
+}
+
+static void rebuild_active_queue(graph_t *g)
+{
+    int N = g->n;
+
+    g->queue_head = 0;
+    g->queue_tail = 0;
+
+    for (int i = 0; i < N; i++) {
+        g->nodes[i].is_in_queue = 0;
+    }
+
+    for (int i = 0; i < N; i++) {
+        if (i == g->source || i == g->sink)
+            continue;
+
+        node_t *u = &g->nodes[i];
+        if (u->e > 0) {
+
+            int next_tail = (g->queue_tail + 1) % g->queue_size;
+            if (next_tail == g->queue_head) {
+                int old_size = g->queue_size;
+                int new_size = old_size * 2;
+                int *newq = xmalloc(new_size * sizeof(int));
+                int idx = 0;
+
+                while (g->queue_head != g->queue_tail) {
+                    newq[idx++] = g->active_queue[g->queue_head];
+                    g->queue_head = (g->queue_head + 1) % old_size;
+                }
+
+                free(g->active_queue);
+                g->active_queue = newq;
+                g->queue_head = 0;
+                g->queue_tail = idx;
+                g->queue_size = new_size;
+
+                next_tail = (g->queue_tail + 1) % g->queue_size;
+            }
+
+            g->active_queue[g->queue_tail] = i;
+            g->queue_tail = next_tail;
+            u->is_in_queue = 1;
+        }
+    }
+}
+
 static void _apply_updates(thread_ctx_t * tctx) {
+    graph_t *g = tctx->g;
+
+    if (g->need_global_relabel) {
+        global_relabel(g);
+        rebuild_active_queue(g);
+
+        for (size_t i = 0; i < tctx->all_thread_ctx_size; i++) {
+            tctx->all_thread_ctx[i].count = 0;
+        }
+        g->work_done = 0;
+        g->need_global_relabel = 0;
+
+        return; /* skip normal relabel updates */
+    }
+
+    for (size_t i = 0; i < tctx->all_thread_ctx_size; i++) {
+        thread_ctx_t *thread_ctx = &tctx->all_thread_ctx[i];
+
+        for (size_t k = 0; k < thread_ctx->count; k++) {
+            update_t update = thread_ctx->plq[k];
+
+            if (update.type == 0) { /* push */
+                update.u->e += update.delta;
+                enter_excess_locked(g, update.u);
+            } else if (update.type == 1) { /* local relabel */
+                update.u->h = update.new_height;
+                update.u->cur = 0;
+                enter_excess_locked(g, update.u);
+            }
+        }
+        thread_ctx->count = 0;
+    }
+}
+
+/*
+static void _apply_updates(thread_ctx_t * tctx) {
+
   int i;
   int k;
   thread_ctx_t * all_thread_contexts = tctx -> all_thread_ctx;
@@ -406,11 +552,15 @@ static void _apply_updates(thread_ctx_t * tctx) {
     thread_ctx -> count = 0;
   }
 }
+  */
 
 static inline void sync_and_apply(thread_ctx_t * tctx) {
   int res = pthread_barrier_wait(tctx -> barrier);
   if (res == PTHREAD_BARRIER_SERIAL_THREAD) {
     _apply_updates(tctx);
+    if (tctx->g->work_done >= tctx->g->global_relabel_freq) {
+        tctx->g->need_global_relabel = 1;
+    }
     if (tctx -> g -> work_counter == 0 && (tctx -> g -> queue_head == tctx -> g -> queue_tail))
       tctx -> g -> done = 1;
   }
@@ -449,7 +599,9 @@ void * worker(void * arg) {
   return NULL;
 }
 
+
 /* ------------------- Graph Init ------------------- */
+/*
 static graph_t * new_graph(FILE * in, int n, int m) {
   graph_t * g = xmalloc(sizeof(graph_t));
   g -> n = n;
@@ -522,30 +674,104 @@ static graph_t * new_graph(FILE * in, int n, int m) {
   free(b);
   free(c);
   return g;
+} */
+
+static graph_t* new_graph(int n, int m, int s, int t, xedge_t* xedges)
+{
+    graph_t* g = xmalloc(sizeof(graph_t));
+    g->n = n;
+    g->m = m;
+    g->need_global_relabel = 0;
+    g->global_relabel_freq = n;
+    g->work_done = 0;
+
+    g->nodes = xcalloc(n, sizeof(node_t));
+
+    int total_e = 2 * m;
+    g->edge_u  = xmalloc(total_e * sizeof(int));
+    g->edge_v  = xmalloc(total_e * sizeof(int));
+    g->edge_f  = xcalloc(total_e, sizeof(int));  /* all flow starts at 0 */
+    g->edge_c  = xmalloc(total_e * sizeof(int));
+    g->edge_rev = xmalloc(total_e * sizeof(int));
+
+    g->source = s;
+    g->sink   = t;
+
+    g->queue_head = 0;
+    g->queue_tail = 0;
+    g->queue_size = 0;
+    g->work_counter = 0;
+
+    int* deg = xcalloc(n, sizeof(int));
+
+    for (int i = 0; i < m; i++) {
+        int u = xedges[i].u;
+        int v = xedges[i].v;
+        deg[u]++;
+        deg[v]++;
+    }
+
+    int prefix = 0;
+    for (int i = 0; i < n; i++) {
+        g->nodes[i].start = prefix;
+        g->nodes[i].degree = deg[i];
+        prefix += deg[i];
+        deg[i] = 0;
+    }
+
+    g->adj = xmalloc(prefix * sizeof(int));
+    for (int i = 0; i < m; i++) {
+        int u = xedges[i].u;
+        int v = xedges[i].v;
+        int c = xedges[i].c;
+
+        int ei  = 2*i;
+        int eri = 2*i + 1;
+
+        g->edge_u[ei]  = u;
+        g->edge_v[ei]  = v;
+        g->edge_c[ei]  = c;
+        g->edge_f[ei]  = 0;
+        g->edge_rev[ei] = eri;
+
+        g->edge_u[eri] = v;
+        g->edge_v[eri] = u;
+        g->edge_c[eri] = c;
+        g->edge_f[eri] = 0;
+        g->edge_rev[eri] = ei;
+
+        g->adj[g->nodes[u].start + deg[u]++] = ei;
+        g->adj[g->nodes[v].start + deg[v]++] = eri;
+    }
+
+    free(deg);
+    return g;
 }
 
+
 static void init_mutexes(graph_t * g) {
-  pthread_mutex_init( & g -> g_lock, NULL);
-  pthread_cond_init( & g -> cv, NULL);
+  pthread_mutex_init(&g->g_lock, NULL);
+  pthread_cond_init(&g->cv, NULL);
 }
+
 static void destroy_mutexes(graph_t * g) {
-  pthread_mutex_destroy( & g -> g_lock);
-  pthread_cond_destroy( & g -> cv);
+  pthread_mutex_destroy(&g -> g_lock);
+  pthread_cond_destroy(&g -> cv);
 }
 
 static void init_preflow(graph_t * g) {
-  node_t * s = & g -> nodes[g -> source];
-  s -> h = g -> n;
-  s -> e = 0;
+  node_t *s = &g->nodes[g->source];
+  s->h = g->n;
+  s->e = 0;
 
   for (int k = 0; k < s -> degree; k++) {
-    int eid = g -> adj[s -> start + k];
-    if (g -> edge_u[eid] == g -> source) s -> e += g -> edge_c[eid];
+    int eid = g->adj[s->start + k];
+    if (g->edge_u[eid] == g->source) s->e += g->edge_c[eid];
   }
-  pr("Source node h=%d, e=%d\n", s -> h, s -> e);
+  pr("Source node h=%d, e=%d\n", s->h, s->e);
 
-  for (int k = 0; k < s -> degree; k++) {
-    int eid = g -> adj[s -> start + k];
+  for (int k = 0; k < s->degree; k++) {
+    int eid = g->adj[s->start + k];
     if (g -> edge_u[eid] == g -> source && g -> edge_c[eid] > 0) {
       node_t * v = & g -> nodes[g -> edge_v[eid]];
       int f = g -> edge_c[eid]; // push full capacity
@@ -563,7 +789,7 @@ static void init_workers(preflow_context_t * algo) {
   graph_t * g = algo -> g;
   pthread_t * threads = algo -> threads;
   int threadcount = algo -> threadcount;
-  int inqueue_batch_size = 12;
+  int inqueue_batch_size = BATCH_SIZE;
 
   thread_ctx_t * ctxs = xcalloc(threadcount, sizeof(thread_ctx_t));
   algo -> thread_ctxs = ctxs;
@@ -571,82 +797,110 @@ static void init_workers(preflow_context_t * algo) {
   g -> done = 0;
 
   for (int i = 0; i < threadcount; i++) {
-    update_t * plq = xcalloc(g -> m, sizeof(update_t));
+    update_t *plq = xcalloc(g->m, sizeof(update_t));
     ctxs[i].g = g;
     ctxs[i].plq = plq;
-    ctxs[i].barrier = algo -> barrier;
+    ctxs[i].barrier = algo->barrier;
     ctxs[i].tid = i;
     ctxs[i].count = 0;
     ctxs[i].all_thread_ctx = ctxs;
     ctxs[i].all_thread_ctx_size = threadcount;
     ctxs[i].inqueue_size = inqueue_batch_size;
     ctxs[i].inqueue = xcalloc(inqueue_batch_size, sizeof(node_t * ));
-    pthread_create( & threads[i], NULL, worker, & ctxs[i]);
+    pthread_create(&threads[i], NULL, worker, &ctxs[i]);
   }
 }
 
-static void join_workers(pthread_t * threads, int threadcount) {
+static void join_workers(pthread_t *threads, int threadcount) {
   for (int i = 0; i < threadcount; i++) pthread_join(threads[i], NULL);
 }
-static void free_ctx(preflow_context_t * algo) {
-  for (int i = 0; i < algo -> threadcount; i++) {
-    free(algo -> thread_ctxs[i].plq);
-    free(algo -> thread_ctxs[i].inqueue);
+static void free_ctx(preflow_context_t *algo) {
+  for (int i = 0; i < algo->threadcount; i++) {
+    free(algo->thread_ctxs[i].plq);
+    free(algo->thread_ctxs[i].inqueue);
   }
-  free(algo -> thread_ctxs);
+  free(algo->thread_ctxs);
 }
 static void free_graph(graph_t * g) {
-  free(g -> nodes);
-  free(g -> edge_u);
-  free(g -> edge_v);
-  free(g -> edge_f);
-  free(g -> edge_c);
-  free(g -> edge_rev);
-  free(g -> adj);
-  free(g -> active_queue);
+  free(g->nodes);
+  free(g->edge_u);
+  free(g->edge_v);
+  free(g->edge_f);
+  free(g->edge_c);
+  free(g->edge_rev);
+  free(g->adj);
+  free(g->active_queue);
   free(g);
 }
 
-static void preflow(preflow_context_t * algo) {
-  graph_t * g = algo -> g;
-  init_mutexes(g);
-  g -> queue_size = 2 * g -> m;
-  g -> active_queue = xmalloc(g -> queue_size * sizeof(int));
-  init_preflow(g);
-  pthread_barrier_init(algo -> barrier, NULL, algo -> threadcount);
-  init_workers(algo);
-  join_workers(algo -> threads, algo -> threadcount);
-  algo -> result = g -> nodes[g -> sink].e;
-  pr("Max flow computed: %d\n", algo -> result);
-  free_ctx(algo);
-  pthread_barrier_destroy(algo -> barrier);
-  destroy_mutexes(g);
+int preflow(int n, int m, int s, int t, xedge_t* xedges) {
+    graph_t* g = new_graph(n, m, s, t, xedges);
+
+    preflow_context_t algo_ctx;
+    //pthread_barrier_t *barrier = malloc(sizeof(pthread_barrier_t));
+
+    pthread_t *threads = malloc(sizeof(pthread_t) * TC);
+
+    init_mutexes(g);
+    g -> queue_size = 2 * (g -> m);
+    g -> active_queue = xmalloc(g -> queue_size * sizeof(int));
+
+    algo_ctx.g = g;
+    algo_ctx.threads = threads;
+    pthread_barrier_t barrier;
+    algo_ctx.barrier = &barrier;
+    pthread_barrier_init(&barrier, NULL, TC);
+    algo_ctx.threadcount = TC;
+
+    init_preflow(g);
+
+    init_workers(&algo_ctx);
+    join_workers(threads, TC);
+
+    algo_ctx.result = g->nodes[g -> sink].e;
+
+    free_ctx(&algo_ctx);
+    pthread_barrier_destroy(&barrier);
+    free(threads);
+    free_graph(g);
+
+    return algo_ctx.result;
 }
 
 /* ------------------- Main ------------------- */
 int main(int argc, char * argv[]) {
-  int tc = 8;
-  pthread_t threads[tc];
+  int threadcount = TC;
+  pthread_t threads[TC];
   pthread_barrier_t barrier;
   progname = argv[0];
 
-  int n = next_int();
-  int m = next_int();
-  next_int();
-  next_int(); // skip extras
-  pr("Read n=%d, m=%d\n", n, m);
+  int n;
+  int i;
+	int m;
 
-  graph_t * g = new_graph(stdin, n, m);
+	n = next_int();
+	m = next_int();
+	i = next_int();
+	i = next_int();
 
-  preflow_context_t algo;
-  algo.g = g;
-  algo.threadcount = tc;
-  algo.threads = threads;
-  algo.barrier = & barrier;
+  xedge_t *edges = (xedge_t *)malloc(m * sizeof(xedge_t));
+  if (!edges)
+  {
+    perror("Failed to allocate edges");
+    exit(1);
+  }
 
-  preflow( & algo);
-  printf("f = %d\n", algo.result);
+  for (i = 0; i < m; i += 1)
+  {
+    edges[i].u = next_int();
+    edges[i].v = next_int();
+    edges[i].c = next_int();   
+	}
 
-  free_graph(g);
+
+  int f = preflow(n, m, 0, n - 1, edges);
+  printf("f = %d\n", f);
+  free(edges);
+
   return 0;
 }
